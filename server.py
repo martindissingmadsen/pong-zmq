@@ -179,7 +179,7 @@ def run(pub, router):
         match.tick(now)
         if match.changed or now >= next_snapshot:
             seq += 1
-            pub.send_json({"seq": seq, "ts": time.time(), **match.message()})
+            pub.send_json({"seq": seq, "ts": time.time(), "t": time.perf_counter(), **match.message()})
             match.changed, next_snapshot = False, now + SNAPSHOT_EVERY
 
 

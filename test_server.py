@@ -150,6 +150,16 @@ class TestMatch(unittest.TestCase):
         match.on_message("clara", {"paddle": {"y": -500, "dir": 9, "t": -100}}, 10)
         self.assertEqual(match.paddles["clara"], {"y": PADDLE_H / 2, "dir": 1, "t": 9.5})
 
+    def test_resent_paddle_only_triggers_a_snapshot_when_it_differs(self):
+        match = two_players()
+        match.on_message("clara", {"paddle": {"y": 300, "dir": 1, "t": 0}}, 0)
+        match.changed = False
+        match.on_message("clara", {"ping": 1.0, "paddle": {"y": 340, "dir": 1, "t": 0.1}}, 0.1)  # same motion
+        self.assertFalse(match.changed)
+        self.assertEqual(match.paddles["clara"], {"y": 340, "dir": 1, "t": 0.1}, "but the record is refreshed")
+        match.on_message("clara", {"ping": 1.0, "paddle": {"y": 200, "dir": 1, "t": 0.2}}, 0.2)  # out of sync
+        self.assertTrue(match.changed)
+
     def test_snapshot_is_complete(self):
         self.assertEqual(set(two_players().message()),
                          {"players", "phase", "ready", "score", "hits", "seg", "paddles"})

@@ -85,10 +85,13 @@ class Match:
         if isinstance(paddle := msg.get("paddle"), dict) and number(paddle.get("y")):
             t = paddle["t"] if number(paddle.get("t")) else now
             half = PADDLE_H / 2
-            self.paddles[name] = {"y": game.clamp(paddle["y"], half, HEIGHT - half),
-                                  "dir": clamp_dir(paddle.get("dir", 0)),
-                                  "t": game.clamp(t, now - PADDLE_CLOCK_SLACK, now)}
-            self.changed = True
+            old, new = self.paddles[name], {"y": game.clamp(paddle["y"], half, HEIGHT - half),
+                                            "dir": clamp_dir(paddle.get("dir", 0)),
+                                            "t": game.clamp(t, now - PADDLE_CLOCK_SLACK, now)}
+            self.paddles[name] = new
+            # clients resend their paddle with every ping; only a real change is worth a snapshot
+            if new["dir"] != old["dir"] or abs(game.paddle_at(new, now) - game.paddle_at(old, now)) > 1:
+                self.changed = True
         if msg.get("ready") is True and self.phase in ("serve", "over") and name not in self.ready:
             self.ready.add(name)
             self.changed = True

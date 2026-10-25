@@ -53,16 +53,20 @@ class TestLinkPing(unittest.TestCase):
         client.STATE_PORT = pub.bind_to_random_port("tcp://127.0.0.1")
         stop = threading.Event()
 
+        received = []
+
         def fake_server():  # answers every ping at once
             while not stop.is_set():
                 if router.poll(10):
                     ident, raw = router.recv_multipart()
-                    if "ping" in (msg := json.loads(raw)):
+                    received.append(msg := json.loads(raw))
+                    if "ping" in msg:
                         router.send_multipart([ident, json.dumps({"pong": msg["ping"], "t": 0.0}).encode()])
 
         server = threading.Thread(target=fake_server)
         server.start()
         link = client.Link("probe", "127.0.0.1")
+        link.paddle = {"y": 250.0, "dir": 1, "t": 3.0}  # as the game loop sets it each frame while playing
         try:
             start = time.perf_counter()
             while len(link.clock.samples) < 3 and time.perf_counter() - start < 3:
@@ -70,6 +74,8 @@ class TestLinkPing(unittest.TestCase):
                 time.sleep(0.05)  # a slow game loop: 20 frames a second
             self.assertGreaterEqual(len(link.clock.samples), 3)
             self.assertLess(min(rtt for rtt, _ in link.clock.samples), 0.01, "not rounded up to a 50 ms frame")
+            pings = [m for m in received if "ping" in m]
+            self.assertTrue(pings and all(m["paddle"] == link.paddle for m in pings), "the paddle rides on every ping")
         finally:
             link.close()
             stop.set()
@@ -106,6 +112,21 @@ class TestBall(unittest.TestCase):
         r = rally("clara", snapshot(paddles=[{"y": 300, "dir": 0, "t": 0}, {"y": 200, "dir": 1, "t": 1.0}]))
         self.assertAlmostEqual(r.frame(1.25, 0)["paddles"][1], 200 + PADDLE_SPEED * 0.25)
 
+    def test_opponent_paddle_glides_to_a_late_key_change(self):
+        moving = [{"y": 300, "dir": 0, "t": 0}, {"y": 300, "dir": 1, "t": 0.0}]
+        r = rally("clara", snapshot(paddles=moving))
+        before = r.frame(0.1, 0)["paddles"][1]  # 340: martin still looks like he's moving
+        stopped = [moving[0], {"y": 320, "dir": 0, "t": 0.05}]  # but he stopped at 0.05; we hear it now
+        r.receive(snapshot(paddles=stopped), 0.1)
+        self.assertAlmostEqual(r.frame(0.1, 0)["paddles"][1], before, msg="no jump when the news arrives")
+        self.assertAlmostEqual(r.frame(1.0, 0)["paddles"][1], 320, delta=0.1)
+
+    def test_opponent_paddle_far_off_jumps(self):
+        r = rally("clara", snapshot())
+        far = [{"y": HEIGHT / 2, "dir": 0, "t": 0}, {"y": HEIGHT / 2 + PADDLE_H + 10, "dir": 0, "t": 0}]
+        r.receive(snapshot(paddles=far), 0.1)
+        self.assertEqual(r.frame(0.1, 0)["paddles"][1], HEIGHT / 2 + PADDLE_H + 10)
+
     def test_ball_follows_its_segment(self):
         seg = {"id": 3, "p": [400, 300], "v": [100, -50], "t": 2.0}
         r = rally("clara", snapshot(seg), t=2.0)
@@ -124,6 +145,20 @@ class TestBall(unittest.TestCase):
         self.assertEqual(r.outbox, [{"hit": {"id": 5, "paddle": HEIGHT / 2}}])
         self.assertGreater(state["vel"][0], 0, "already on its way back")
         self.assertEqual(state["hits"], 1, "counted before the server confirms, so the meow isn't late")
+
+    def test_own_paddle_is_judged_at_the_moment_of_contact(self):
+        r = rally("clara", snapshot(toward_left(y=300)))  # the ball reaches the paddle at time 0.2
+        r.frame(0.19, 1)  # start moving down just before
+        r.frame(0.4, 1)  # a stalled frame: by now the paddle is 84 units lower, out of reach
+        self.assertEqual(len(r.outbox), 2)
+        call = r.outbox[1]
+        self.assertIn("hit", call, "at contact it was only 4 units lower")
+        self.assertAlmostEqual(call["hit"]["paddle"], 300 + PADDLE_SPEED * 0.01)
+
+    def test_a_key_pressed_after_contact_does_not_count(self):
+        r = rally("clara", snapshot(toward_left(y=300)))
+        r.frame(0.35, -1)  # the frame that notices the contact also has a new key press
+        self.assertEqual(r.outbox[0], {"hit": {"id": 5, "paddle": HEIGHT / 2}})
 
     def test_defender_misses_and_the_ball_flies_on(self):
         r = rally("clara", snapshot(toward_left(y=300), paddles=[{"y": 300 + PADDLE_H, "dir": 0, "t": 0}] * 2))

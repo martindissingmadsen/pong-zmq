@@ -48,6 +48,13 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def paddle_at(rec, t):
+    """Where a paddle is at time t, from its last key change: at y at time rec["t"], then
+    moving with dir. Server and clients all compute a paddle they don't control this way."""
+    half = PADDLE_H / 2
+    return clamp(rec["y"] + rec["dir"] * PADDLE_SPEED * max(0.0, t - rec["t"]), half, HEIGHT - half)
+
+
 def face_x(side):
     """x of the paddle face the ball meets on that side."""
     return PADDLE_X[side] + (PADDLE_W / 2 if side == 0 else -PADDLE_W / 2)

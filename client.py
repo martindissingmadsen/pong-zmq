@@ -37,7 +37,7 @@ import zmq
 
 import effects
 import game
-from game import BALL_SIZE, HEIGHT, PADDLE_H, PADDLE_SPEED, PADDLE_W, PADDLE_X, WIDTH
+from game import BALL_SIZE, HEIGHT, PADDLE_H, PADDLE_W, PADDLE_X, WIDTH
 
 MAX_FPS = 240  # vsync normally sets the pace; this only caps it when vsync is off
 MAX_DT = 1 / 30  # a stalled frame must not move the ball through a paddle
@@ -50,6 +50,7 @@ PING_EVERY = 0.2  # s; pings keep the clock in sync and double as the heartbeat
 CLOCK_SAMPLES = 15  # recent pings; the clock trusts the one with the shortest round trip
 GLIDE_RATE = 12  # per second: how fast the ball glides onto a corrected path
 GLIDE_MAX = 120  # units; a bigger correction (a serve, a goal) jumps instead
+PADDLE_GLIDE_MAX = PADDLE_H  # units; an opponent paddle further off than this jumps (e.g. after a reconnect)
 
 
 class View:
@@ -138,12 +139,6 @@ class Clock:
         self.offset = min(self.samples)[1]
 
 
-def paddle_at(rec, t):
-    """Where a paddle is at time t, from its last key change: at y at time t0, then moving with dir."""
-    half = PADDLE_H / 2
-    return game.clamp(rec["y"] + rec["dir"] * PADDLE_SPEED * max(0.0, t - rec["t"]), half, HEIGHT - half)
-
-
 def path(seg, t):
     """Where a ball segment is at server time t: still at its start until then."""
     return game.fly(seg["p"], seg["v"], max(0.0, t - seg["t"]))
@@ -160,6 +155,7 @@ class Rally:
         self.decided = None  # id of the last segment whose paddle contact was handled
         self.mine = {"y": HEIGHT / 2, "dir": 0, "t": 0.0}  # our paddle's last key change, as we send it
         self.glide = [0.0, 0.0]  # display offset that fades out after a correction
+        self.paddle_glide = [0.0, 0.0]  # the same for each opponent paddle when its key change arrives
         self.outbox = []
 
     def side(self):
@@ -168,7 +164,14 @@ class Rally:
 
     def receive(self, snap, t):
         """A snapshot from the server. t is the server time now, or None before the clock is synced."""
-        self.snap = snap
+        old, self.snap = self.snap, snap
+        if old is not None and t is not None and old["players"] == snap["players"]:
+            # an opponent's key change arrives a network delay late: glide there instead of jumping
+            for i, rec in enumerate(snap["paddles"]):
+                gap = self.paddle_glide[i] + game.paddle_at(old["paddles"][i], t) - game.paddle_at(rec, t)
+                self.paddle_glide[i] = gap if abs(gap) < PADDLE_GLIDE_MAX else 0.0
+        else:
+            self.paddle_glide = [0.0, 0.0]
         seg = snap["seg"]
         if self.seg is None or seg["id"] > self.seg["id"] or (seg["id"] == self.seg["id"] and self.provisional):
             self._switch(seg, t, provisional=False)
@@ -186,7 +189,14 @@ class Rally:
 
     def _paddle(self, i, t):
         """Where paddle i is at time t. Ours from our own last key change, the others from theirs."""
-        return paddle_at(self.mine if i == self.side() else self.snap["paddles"][i], t)
+        return game.paddle_at(self.mine if i == self.side() else self.snap["paddles"][i], t)
+
+    def _paddle_shown(self, i, t):
+        """Paddle i as drawn: an opponent's includes what is left of its glide."""
+        if i == self.side():
+            return self._paddle(i, t)
+        half = PADDLE_H / 2
+        return game.clamp(self._paddle(i, t) + self.paddle_glide[i], half, HEIGHT - half)
 
     def _contact(self, t, side):
         """Once the ball reaches a paddle: decide hit or miss for our own side, predict it for the other."""
@@ -199,7 +209,7 @@ class Rally:
             return
         self.decided = seg["id"]
         mine = target == side
-        paddle = self._paddle(target, t if mine else when)
+        paddle = self._paddle(target, when)  # at the moment of contact, not this (later) frame
         after = game.bounce(target, pos[1], paddle, vel)
         if mine:
             self.outbox.append({"hit": {"id": seg["id"], "paddle": paddle}} if after else {"miss": {"id": seg["id"]}})
@@ -211,20 +221,21 @@ class Rally:
         dt = 0.0 if self.t is None else max(0.0, t - self.t)  # real time: everything here is exact for any dt
         self.t = t
         snap, side = self.snap, self.side()
+        if snap["phase"] == "playing":
+            self._contact(t, side)  # before a key change this frame, which only counts from now on
         if side is not None:
             if ready and snap["phase"] in ("serve", "over"):
                 self.outbox.append({"ready": True})
             if d != self.mine["dir"]:
                 # computed from the key change and the clock, exactly as the other machines compute it
-                self.mine = {"y": paddle_at(self.mine, t), "dir": d, "t": t}
+                self.mine = {"y": game.paddle_at(self.mine, t), "dir": d, "t": t}
                 self.outbox.append({"paddle": self.mine})
-        if snap["phase"] == "playing":
-            self._contact(t, side)
 
         fade = math.exp(-GLIDE_RATE * dt)
         self.glide = [g * fade for g in self.glide]
+        self.paddle_glide = [g * fade for g in self.paddle_glide]
         ball, vel = self._ball(t)
-        paddles = [self._paddle(i, t) for i in range(len(snap["players"]))]
+        paddles = [self._paddle_shown(i, t) for i in range(len(snap["players"]))]
         return {"players": snap["players"], "phase": snap["phase"], "ready": snap["ready"],
                 "score": snap["score"], "hits": snap["hits"] + self.provisional,
                 "ball": ball, "vel": vel, "paddles": paddles}
@@ -249,6 +260,7 @@ class Link:
         self.pongs = queue.SimpleQueue()  # thread -> game loop: (sent, server time, received)
         self.clock, self.rally = Clock(), Rally(name)
         self.seq = 0  # messages sent so far, counted by the thread
+        self.paddle = None  # our paddle as of the last frame, resent with every ping; None while watching
         self.thread = threading.Thread(target=self._talk, args=(name, host, address), daemon=True)
         self.thread.start()
 
@@ -275,7 +287,9 @@ class Link:
         try:
             while True:
                 if time.perf_counter() >= next_ping:
-                    send({"ping": time.perf_counter()})
+                    # the paddle rides along, so a missed or stale key change (a reconnect) heals itself
+                    paddle = self.paddle
+                    send({"ping": time.perf_counter(), **({"paddle": paddle} if paddle else {})})
                     next_ping = time.perf_counter() + PING_EVERY
                 wait = max(0.0, next_ping - time.perf_counter())
                 ready = dict(poller.poll(wait * 1000))
@@ -313,6 +327,9 @@ class Link:
         if t is None or self.rally.snap is None:
             return None
         shown = self.rally.frame(t, d, ready)
+        mine = self.rally.mine
+        self.paddle = None if self.rally.side() is None else {
+            "y": game.paddle_at(mine, t), "dir": mine["dir"], "t": t}  # same motion, fresh start time
         for msg in self.rally.outbox:
             self.send(msg)
         self.rally.outbox.clear()

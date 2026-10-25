@@ -24,6 +24,7 @@ after the contact it arrived. over: the winner and the final score.
 """
 import csv
 import math
+import os
 import random
 import time
 from pathlib import Path
@@ -39,7 +40,7 @@ SNAPSHOT_EVERY = 1.0  # s; also sent on every change, this only catches up late 
 POLL_MS = 20  # how often the loop wakes up to check timeouts when nothing arrives
 PADDLE_CLOCK_SLACK = 0.5  # s; a paddle change may say it happened at most this long ago
 CENTRE = [WIDTH / 2, HEIGHT / 2]
-LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR = Path(os.environ.get("PONG_LOG_DIR", Path(__file__).parent / "logs"))  # experiments point this elsewhere
 LOG_FIELDS = ("t", "event", "player", "seq", "ts", "value")
 KINDS = ("ping", "paddle", "hit", "miss", "ready")  # what a client message can carry
 
@@ -171,7 +172,7 @@ def serve():
     router = ctx.socket(zmq.ROUTER)
     router.setsockopt(zmq.ROUTER_HANDOVER, 1)  # a client reconnecting under the same name takes over its old slot
     router.bind("tcp://*:5556")
-    LOG_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     path = LOG_DIR / time.strftime("server-%Y%m%d-%H%M%S.csv")
     try:
         with open(path, "w", newline="", buffering=1) as f:  # line-buffered: a crash loses at most one row

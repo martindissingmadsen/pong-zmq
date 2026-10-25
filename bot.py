@@ -1,12 +1,13 @@
 """Headless bot: plays one networked match without a window, for experiments (see PLAN.md).
 
-    python bot.py NAME [HOST] [--miss SIGMA]
+    python bot.py NAME [HOST] [--miss SIGMA] [--log DIR] [--seed N] [--seconds S]
 
 Built on client.Link, so it speaks exactly the protocol a real client does: clock sync,
 key changes, its own hit or miss calls. It moves its paddle to where the ball will meet it,
 but aims off by a random amount per shot (normally distributed, SIGMA units, default 40),
 so it misses sometimes and a match ends. It presses Space whenever a ball waits and quits
-once the match is over.
+once the match is over, or after --seconds S. --log DIR writes the client CSV logs (see
+telemetry.py) and --seed N makes its aim repeatable, both for the experiments (experiments.py).
 
 Two bots against server.py make a bot-vs-bot match:
     python server.py & python bot.py left & python bot.py right
@@ -35,11 +36,12 @@ def choose_dir(state, side, aim_off):
     return 1 if target > y else -1
 
 
-def play(name, host, sigma):
-    link = Link(name, host)
+def play(name, host, sigma, log_dir=None, seconds=None):
+    link = Link(name, host, log_dir)
     d, ready, aim, last_ready = 0, False, (None, 0.0), 0.0
+    stop = None if seconds is None else time.perf_counter() + seconds
     try:
-        while True:
+        while stop is None or time.perf_counter() < stop:
             state = link.update(d, ready)  # sends what we decided last frame
             ready, now = False, time.perf_counter()
             if state and name in state["players"]:
@@ -61,15 +63,19 @@ def play(name, host, sigma):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    sigma = 40.0
-    if "--miss" in args:
-        i = args.index("--miss")
-        sigma = float(args[i + 1])
-        del args[i:i + 2]
+    options = {"--miss": "40", "--log": None, "--seed": None, "--seconds": None}
+    for flag in options:
+        if flag in args:
+            i = args.index(flag)
+            options[flag] = args[i + 1]
+            del args[i:i + 2]
     if len(args) not in (1, 2):
         print(__doc__)
         sys.exit(1)
+    if options["--seed"] is not None:
+        random.seed(int(options["--seed"]))
+    seconds = None if options["--seconds"] is None else float(options["--seconds"])
     try:
-        play(args[0], args[1] if len(args) == 2 else "localhost", sigma)
+        play(args[0], args[1] if len(args) == 2 else "localhost", float(options["--miss"]), options["--log"], seconds)
     except KeyboardInterrupt:
         pass

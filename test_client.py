@@ -1,6 +1,11 @@
 """Unit tests for the networked client's clock and rally logic (no sockets):  python -m unittest"""
+import json
 import math
+import threading
+import time
 import unittest
+
+import zmq
 
 import client
 import game
@@ -36,6 +41,41 @@ class TestClock(unittest.TestCase):
         clock.pong(sent=12.0, server_t=112.50, received=12.6)
         self.assertAlmostEqual(clock.offset, 100.0)
         self.assertAlmostEqual(clock.rtt, 0.6, msg="rtt shows the latest round trip")
+
+
+
+class TestLinkPing(unittest.TestCase):
+    def test_ping_does_not_wait_for_the_next_frame(self):
+        ctx = zmq.Context()
+        router, pub = ctx.socket(zmq.ROUTER), ctx.socket(zmq.PUB)
+        old_ports = client.STATE_PORT, client.INPUT_PORT
+        client.INPUT_PORT = router.bind_to_random_port("tcp://127.0.0.1")
+        client.STATE_PORT = pub.bind_to_random_port("tcp://127.0.0.1")
+        stop = threading.Event()
+
+        def fake_server():  # answers every ping at once
+            while not stop.is_set():
+                if router.poll(10):
+                    ident, raw = router.recv_multipart()
+                    if "ping" in (msg := json.loads(raw)):
+                        router.send_multipart([ident, json.dumps({"pong": msg["ping"], "t": 0.0}).encode()])
+
+        server = threading.Thread(target=fake_server)
+        server.start()
+        link = client.Link("probe", "127.0.0.1")
+        try:
+            start = time.perf_counter()
+            while len(link.clock.samples) < 3 and time.perf_counter() - start < 3:
+                link.update(0)
+                time.sleep(0.05)  # a slow game loop: 20 frames a second
+            self.assertGreaterEqual(len(link.clock.samples), 3)
+            self.assertLess(min(rtt for rtt, _ in link.clock.samples), 0.01, "not rounded up to a 50 ms frame")
+        finally:
+            link.close()
+            stop.set()
+            server.join()
+            ctx.destroy(linger=0)
+            client.STATE_PORT, client.INPUT_PORT = old_ports
 
 
 class TestOwnPaddle(unittest.TestCase):

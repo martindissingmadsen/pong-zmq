@@ -21,8 +21,11 @@ The window is sized to the screen and runs at the display's refresh rate
 assets/cat_left.png and assets/cat_right.png are drawn over the paddles when present.
 """
 import io
+import json
 import math
+import queue
 import sys
+import threading
 import time
 import wave
 from array import array
@@ -42,6 +45,7 @@ ASSETS = Path(__file__).parent / "assets"
 BG, FG, DIM = (20, 20, 28), (235, 235, 235), (90, 90, 100)
 
 # networked only
+STATE_PORT, INPUT_PORT = 5555, 5556  # server.py's PUB and ROUTER
 PING_EVERY = 0.2  # s; pings keep the clock in sync and double as the heartbeat
 CLOCK_SAMPLES = 15  # recent pings; the clock trusts the one with the shortest round trip
 GLIDE_RATE = 12  # per second: how fast the ball glides onto a corrected path
@@ -227,38 +231,82 @@ class Rally:
 
 
 class Link:
-    """The sockets: pings and messages out on a DEALER, snapshots in on a SUB."""
+    """The sockets: snapshots in on a SUB, everything else through a DEALER that a small thread owns.
+
+    The thread sends the pings itself and timestamps each pong the moment it arrives. Done
+    in the game loop, both would wait for the next frame, which on one machine turned a
+    sub-millisecond round trip into about 8 ms at 120 fps, and pulled the clock 4 ms late."""
 
     def __init__(self, name, host):
         self.ctx = zmq.Context()
         self.sub = self.ctx.socket(zmq.SUB)
         self.sub.setsockopt(zmq.CONFLATE, 1)  # every snapshot is complete, so only the newest matters
         self.sub.setsockopt(zmq.SUBSCRIBE, b"")
-        self.sub.connect(f"tcp://{host}:5555")
-        self.dealer = self.ctx.socket(zmq.DEALER)
-        self.dealer.setsockopt(zmq.IDENTITY, name.encode())
-        self.dealer.setsockopt(zmq.IMMEDIATE, 1)  # don't queue messages while the server is unreachable
-        self.dealer.connect(f"tcp://{host}:5556")
+        self.sub.connect(f"tcp://{host}:{STATE_PORT}")
+        self.pipe = self.ctx.socket(zmq.PAIR)  # game loop -> thread; wakes the thread at once
+        address = f"inproc://link-{id(self)}"
+        self.pipe.bind(address)
+        self.pongs = queue.SimpleQueue()  # thread -> game loop: (sent, server time, received)
         self.clock, self.rally = Clock(), Rally(name)
-        self.seq, self.next_ping = 0, 0.0
+        self.seq = 0  # messages sent so far, counted by the thread
+        self.thread = threading.Thread(target=self._talk, args=(name, host, address), daemon=True)
+        self.thread.start()
+
+    def _talk(self, name, host, address):
+        """The thread: forwards the game loop's messages, pings on time, timestamps pongs on arrival."""
+        pipe = self.ctx.socket(zmq.PAIR)
+        pipe.connect(address)
+        dealer = self.ctx.socket(zmq.DEALER)
+        dealer.setsockopt(zmq.IDENTITY, name.encode())
+        dealer.setsockopt(zmq.IMMEDIATE, 1)  # don't queue messages while the server is unreachable
+        dealer.connect(f"tcp://{host}:{INPUT_PORT}")
+        poller = zmq.Poller()
+        poller.register(pipe, zmq.POLLIN)
+        poller.register(dealer, zmq.POLLIN)
+
+        def send(msg):
+            self.seq += 1
+            try:
+                dealer.send_json({"seq": self.seq, "ts": time.time(), **msg}, zmq.NOBLOCK)
+            except zmq.Again:  # not connected (yet); a stale message is worthless, so drop it
+                pass
+
+        next_ping = time.perf_counter()
+        try:
+            while True:
+                if time.perf_counter() >= next_ping:
+                    send({"ping": time.perf_counter()})
+                    next_ping = time.perf_counter() + PING_EVERY
+                wait = max(0.0, next_ping - time.perf_counter())
+                ready = dict(poller.poll(wait * 1000))
+                if dealer in ready:
+                    while dealer.poll(0):
+                        raw = dealer.recv()
+                        received = time.perf_counter()  # before anything else, parsing included
+                        msg = json.loads(raw)
+                        if "pong" in msg:
+                            self.pongs.put((msg["pong"], msg["t"], received))
+                if pipe in ready:
+                    while pipe.poll(0):
+                        raw = pipe.recv()
+                        if not raw:  # close() asks the thread to stop
+                            return
+                        send(json.loads(raw))
+        finally:
+            dealer.close(linger=0)
+            pipe.close(linger=0)
 
     def send(self, msg):
-        self.seq += 1
-        try:
-            self.dealer.send_json({"seq": self.seq, "ts": time.time(), **msg}, zmq.NOBLOCK)
-        except zmq.Again:  # not connected (yet); a stale message is worthless, so drop it
-            pass
+        self.pipe.send_json(msg)
 
     def update(self, d, ready=False):
-        """One frame: ping when due, take in replies and the newest snapshot, advance the rally.
+        """One frame: take in the clock samples and the newest snapshot, advance the rally.
         Returns the state to draw, or None until the clock is synced and a snapshot has arrived."""
-        if time.perf_counter() >= self.next_ping:
-            self.send({"ping": time.perf_counter()})
-            self.next_ping = time.perf_counter() + PING_EVERY
-        while self.dealer.poll(0):
-            msg = self.dealer.recv_json()
-            if "pong" in msg:
-                self.clock.pong(msg["pong"], msg["t"], time.perf_counter())
+        while True:
+            try:
+                self.clock.pong(*self.pongs.get_nowait())
+            except queue.Empty:
+                break
         t = None if self.clock.offset is None else time.perf_counter() + self.clock.offset
         if self.sub.poll(0):
             self.rally.receive(self.sub.recv_json(), t)
@@ -271,6 +319,8 @@ class Link:
         return shown
 
     def close(self):
+        self.pipe.send(b"")
+        self.thread.join(timeout=1)
         self.ctx.destroy(linger=0)
 
 

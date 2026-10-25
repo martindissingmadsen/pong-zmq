@@ -1,6 +1,8 @@
 """Unit tests for the networked client's clock and rally logic (no sockets):  python -m unittest"""
+import csv
 import json
 import math
+import tempfile
 import threading
 import time
 import unittest
@@ -9,6 +11,7 @@ import zmq
 
 import client
 import game
+import telemetry
 from client import GLIDE_MAX, Clock, Rally
 from game import HEIGHT, PADDLE_H, PADDLE_SPEED, R, WIDTH
 
@@ -217,6 +220,42 @@ class TestBall(unittest.TestCase):
         r.receive(snapshot(serve, phase="serve", score=(0, 1)), 0.4)  # but clara missed
         self.assertEqual(r.frame(0.4, 0)["ball"], [WIDTH / 2, HEIGHT / 2])
         self.assertGreater(math.dist([LEFT_FACE + R, 300], [WIDTH / 2, HEIGHT / 2]), GLIDE_MAX)
+
+
+class TestContactLog(unittest.TestCase):
+    def test_our_hit_confirmed(self):
+        r = rally("clara", snapshot(toward_left(y=300)))
+        r.frame(0.21, 0)
+        r.receive(snapshot({**r.seg}, hits=1), 0.31, arrived=0.3)
+        (kind, t, seg, side, mine, call, late_ms, answer_ms, outcome, agreed, correction), = r.events
+        self.assertEqual((kind, seg, side, mine, call, outcome, agreed), ("contacts", 5, 0, 1, "hit", "hit", 1))
+        self.assertAlmostEqual(late_ms, 10)  # contact at 0.2, noticed in the frame at 0.21
+        self.assertAlmostEqual(answer_ms, 100)
+        self.assertAlmostEqual(correction, 0)
+
+    def test_wrong_prediction(self):
+        r = rally("martin", snapshot(toward_left(y=300)))
+        r.frame(0.21, 0)  # predicts clara hits
+        serve = {"id": 6, "p": [WIDTH / 2, HEIGHT / 2], "v": [0, 0], "t": 0.3}
+        r.receive(snapshot(serve, phase="serve", score=(0, 1)), 0.3)  # she missed
+        event = r.events[0]
+        self.assertEqual(event[4:6] + event[8:10], (0, "hit", "goal", 0))
+        self.assertIsNone(event[10], "after a goal the ball is reset, so there is no correction to measure")
+
+
+class TestRecorder(unittest.TestCase):
+    def test_files_have_headers_and_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rec = telemetry.Recorder(directory, "clara")
+            rec.row("contacts", 12.5, 5, 0, 1, "hit", 10.0, 100.0, "hit", 1, 0.0)
+            rec.close()
+            with open(f"{rec.prefix}-contacts.csv") as f:
+                rows = list(csv.reader(f))
+            self.assertEqual(rows[0], telemetry.COLUMNS["contacts"])
+            self.assertEqual(rows[1][1:], ["12.500", "5", "0", "1", "hit", "10.000", "100.000", "hit", "1", "0.000"])
+            for kind in telemetry.COLUMNS:
+                with open(f"{rec.prefix}-{kind}.csv") as f:
+                    self.assertEqual(next(csv.reader(f)), telemetry.COLUMNS[kind])
 
 
 class TestMeow(unittest.TestCase):

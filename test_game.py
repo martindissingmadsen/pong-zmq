@@ -163,5 +163,54 @@ class TestStepContract(unittest.TestCase):
         self.assertGreater(state["hits"], 0)
 
 
+
+class TestNetworkRules(unittest.TestCase):
+    """fly, meet and bounce: the pieces server and clients use instead of step."""
+
+    def test_fly_matches_stepping_between_the_walls(self):
+        ball, vel = [400, 300], [0, 480]  # straight up and down, so no paddle is involved
+        state = state_with(ball=ball, vel=vel)
+        for _ in range(600):
+            state = step(state, 0, 0, 1 / 120)
+        pos, v = game.fly(ball, vel, 5.0)
+        self.assertAlmostEqual(pos[1], state["ball"][1], places=6)
+        self.assertEqual(math.copysign(1, v[1]), math.copysign(1, state["vel"][1]))
+
+    def test_fly_stays_in_the_field_for_any_time(self):
+        for dt in (0, 0.01, 0.7, 3.3, 100.0):
+            (_, y), _ = game.fly([400, 300], [0, -650], dt)
+            self.assertTrue(R <= y <= HEIGHT - R, (dt, y))
+
+    def test_fly_is_exact_in_one_go_or_in_pieces(self):
+        pos, vel = game.fly([400, 100], [-200, -500], 0.3)
+        pos, vel = game.fly(pos, vel, 0.45)
+        whole, _ = game.fly([400, 100], [-200, -500], 0.75)
+        for a, b in zip(pos, whole):
+            self.assertAlmostEqual(a, b)
+
+    def test_meet_finds_the_paddle_face(self):
+        dt, side, (x, _), _ = game.meet([400, 300], [-200, 0])
+        self.assertEqual(side, 0)
+        self.assertAlmostEqual(x, LEFT_FACE + R)
+        self.assertAlmostEqual(dt, (400 - (LEFT_FACE + R)) / 200)
+        dt, side, (x, _), _ = game.meet([400, 300], [300, 50])
+        self.assertEqual(side, 1)
+        self.assertAlmostEqual(x, RIGHT_FACE - R)
+
+    def test_meet_needs_sideways_motion(self):
+        self.assertIsNone(game.meet([400, 300], [0, 100]))
+
+    def test_bounce_is_the_rule_step_uses(self):
+        start = state_with(ball=[LEFT_FACE + R + 2, 260], vel=[-300, 0], paddles=[300, 300])
+        stepped = step(start, 0, 0, 0.1)["vel"]
+        bounced = game.bounce(0, 260, 300, [-300, 0])
+        for a, b in zip(stepped, bounced):
+            self.assertAlmostEqual(a, b)
+
+    def test_bounce_misses_beyond_the_paddle_ends(self):
+        self.assertIsNone(game.bounce(1, 300 + PADDLE_H / 2 + R + 1, 300, [300, 0]))
+        self.assertIsNotNone(game.bounce(1, 300 + PADDLE_H / 2 + R - 1, 300, [300, 0]))
+
+
 if __name__ == "__main__":
     unittest.main()

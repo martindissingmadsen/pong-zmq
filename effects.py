@@ -113,7 +113,7 @@ class FX:
         self.size = round(WIDTH * s), round(HEIGHT * s)
         self.background = self._background()
         self.sprites = {}  # (colour, size) -> brightness levels of a glow dot
-        self.ball_glows = [levels(glow((round(60 * s),) * 2, heat_colour(i / 7), round(10 * s))) for i in range(8)]
+        self.ball_glows = [levels(glow((round(30 * s),) * 2, heat_colour(i / 7), round(6 * s))) for i in range(8)]
         self.paddle_glows = [glow((round((PADDLE_W + 16) * s), round((PADDLE_H + 16) * s)), c, round(12 * s),
                                   "rect", round(10 * s)) for c in SIDES]
         self.meows = [view.fonts[1].render("meow!", True, c) for c in SIDES]
@@ -123,7 +123,7 @@ class FX:
             for size in range(2, 11):
                 self.dot(colour, size)
         for i in range(8):
-            self.dot(heat_colour(i / 7), 12), self.dot(heat_colour(i / 7), 5)
+            self.dot(heat_colour(i / 7), 8), self.dot(heat_colour(i / 7), 5)
         for colour in SIDES:
             self.dot(colour, 30), self.dot(colour, 160)
         self.dot(DUST, 4)
@@ -330,9 +330,9 @@ class FX:
             self.trail.append((bx, by))
         del self.trail[:-round(10 + 14 * max(0, heat))]
         colour = heat_colour(step / 7)
-        trail_dot = self.dot(colour, 12)
+        trail_dot = self.dot(colour, 8)
         for i, (tx, ty) in enumerate(self.trail[:-1]):
-            self._add(screen, trail_dot, 0.6 * (i + 1) / len(self.trail), tx, ty)
+            self._add(screen, trail_dot, 0.3 * (i + 1) / len(self.trail), tx, ty)
         if heat > 0.4 and not over and random.random() < heat * 60 * dt:
             self.particles.append(Particle(bx, by, -vx * 0.1 + random.uniform(-40, 40), -vy * 0.1 + random.uniform(-40, 40),
                                            0.4, colour, 5, drag=2))
@@ -348,7 +348,7 @@ class FX:
                                  radius * (0.2 + 0.8 * math.sqrt(k)) * s, max(1, round(3 * s * (1 - k))))
 
         # the ball itself: glow, then a core that pops on a hit
-        self._add(screen, self.ball_glows[step], 0.8 + 0.2 * math.sin(self.t * 12), bx, by)
+        self._add(screen, self.ball_glows[step], 0.35 + 0.05 * math.sin(self.t * 12), bx, by)  # a soft halo, not a lamp
         pygame.draw.aacircle(screen, mix(colour, FG, 0.5), view.point(bx, by), R * (1 + 0.7 * self.ball_pop / 0.15) * s)
 
         for x, y, age, side in self.texts:

@@ -6,11 +6,13 @@
 Add --plain to either for the flat look without effects.py (glow, particles, shake),
 e.g. for experiments where only the network should cost time.
 
-Networked, the client sends its input every frame and draws the newest state from
-the server; the first two names to join play left and right, later ones watch.
-Names must differ: the server tells players apart by name. To feel smooth between
-server states, it moves your own paddle as soon as you press a key and moves the
-ball forward from its last velocity.
+Networked, the first two names to join play left and right, later ones watch. Names
+must differ: the server tells players apart by name. Messages only flow when something
+happens (see server.py): your paddle is yours alone and never waits for the network,
+and when the ball reaches your paddle, your client decides hit or miss on the spot and
+tells the server. Between those moments both clients compute the ball's path themselves;
+the opponent's call arrives a moment later, and until then the client predicts it from
+where the opponent's paddle is heading. The ping to the server shows bottom left.
 
 A cat meows on every paddle hit: assets/meow.wav when present, else a synthetic one.
 
@@ -24,6 +26,7 @@ import sys
 import time
 import wave
 from array import array
+from collections import deque
 from pathlib import Path
 
 import pygame
@@ -38,11 +41,11 @@ MAX_DT = 1 / 30  # a stalled frame must not move the ball through a paddle
 ASSETS = Path(__file__).parent / "assets"
 BG, FG, DIM = (20, 20, 28), (235, 235, 235), (90, 90, 100)
 
-# smoothing between server states (networked only)
-SETTLE = 0.1  # s without input before your paddle eases back to where the server has it
-CORRECTION = 10  # per second: how fast it eases back
-SNAP = PADDLE_H / 2  # further off than this, jump straight to the server's position
-MAX_AHEAD = 0.1  # s; the ball is never moved forward further than this past the last state
+# networked only
+PING_EVERY = 0.2  # s; pings keep the clock in sync and double as the heartbeat
+CLOCK_SAMPLES = 15  # recent pings; the clock trusts the one with the shortest round trip
+GLIDE_RATE = 12  # per second: how fast the ball glides onto a corrected path
+GLIDE_MAX = 120  # units; a bigger correction (a serve, a goal) jumps instead
 
 
 class View:
@@ -117,25 +120,158 @@ def load_meow():
         return None
 
 
-def predict_paddle(y, server_y, d, idle, dt):
-    """Your own paddle: moves with your input at once, like game.step will move it on the
-    server a moment later. Once you have let go for SETTLE seconds it eases back to the
-    server's position, and it jumps there if it is ever more than SNAP off."""
-    y = game.clamp(y + d * PADDLE_SPEED * dt, PADDLE_H / 2, HEIGHT - PADDLE_H / 2)
-    if abs(server_y - y) > SNAP:
-        return server_y
-    if idle >= SETTLE:
-        y += (server_y - y) * min(1, CORRECTION * dt)
-    return y
+class Clock:
+    """Server time, from pings: the offset measured over the fastest recent round trip,
+    because a slow round trip leaves the most doubt about when the server answered."""
+
+    def __init__(self):
+        self.samples = deque(maxlen=CLOCK_SAMPLES)
+        self.offset = self.rtt = None
+
+    def pong(self, sent, server_t, received):
+        self.rtt = received - sent
+        self.samples.append((self.rtt, server_t - (sent + received) / 2))
+        self.offset = min(self.samples)[1]
 
 
-def ball_ahead(state, age):
-    """The ball moved forward `age` seconds from its last velocity, bouncing as in game.step.
-    Never past a goal: scoring is the server's call, so then it stays where the state has it."""
-    if age <= 0:
-        return state["ball"]
-    ahead = game.step(state, 0, 0, min(age, MAX_AHEAD))
-    return ahead["ball"] if ahead["score"] == state["score"] else state["ball"]
+def paddle_at(rec, t):
+    """Where a paddle is at time t, from its last key change: at y at time t0, then moving with dir."""
+    half = PADDLE_H / 2
+    return game.clamp(rec["y"] + rec["dir"] * PADDLE_SPEED * max(0.0, t - rec["t"]), half, HEIGHT - half)
+
+
+def path(seg, t):
+    """Where a ball segment is at server time t: still at its start until then."""
+    return game.fly(seg["p"], seg["v"], max(0.0, t - seg["t"]))
+
+
+class Rally:
+    """The networked game as this client sees it between the server's snapshots. No sockets:
+    Link feeds it snapshots and server time, and sends whatever ends up in `outbox`."""
+
+    def __init__(self, name):
+        self.name = name
+        self.snap = self.seg = self.t = None
+        self.provisional = False  # the segment is our own call or prediction, not yet from the server
+        self.decided = None  # id of the last segment whose paddle contact was handled
+        self.mine = {"y": HEIGHT / 2, "dir": 0, "t": 0.0}  # our paddle's last key change, as we send it
+        self.glide = [0.0, 0.0]  # display offset that fades out after a correction
+        self.outbox = []
+
+    def side(self):
+        players = self.snap["players"]
+        return players.index(self.name) if self.name in players else None
+
+    def receive(self, snap, t):
+        """A snapshot from the server. t is the server time now, or None before the clock is synced."""
+        self.snap = snap
+        seg = snap["seg"]
+        if self.seg is None or seg["id"] > self.seg["id"] or (seg["id"] == self.seg["id"] and self.provisional):
+            self._switch(seg, t, provisional=False)
+
+    def _switch(self, seg, t, provisional):
+        """Follow a new segment, gliding from where the ball is drawn now unless that is far off."""
+        if self.seg is not None and t is not None:
+            gap = [a - b for a, b in zip(self._ball(t)[0], path(seg, t)[0])]
+            self.glide = gap if math.hypot(*gap) < GLIDE_MAX else [0.0, 0.0]
+        self.seg, self.provisional = seg, provisional
+
+    def _ball(self, t):
+        (x, y), vel = path(self.seg, t)
+        return [x + self.glide[0], y + self.glide[1]], vel
+
+    def _paddle(self, i, t):
+        """Where paddle i is at time t. Ours from our own last key change, the others from theirs."""
+        return paddle_at(self.mine if i == self.side() else self.snap["paddles"][i], t)
+
+    def _contact(self, t, side):
+        """Once the ball reaches a paddle: decide hit or miss for our own side, predict it for the other."""
+        seg = self.seg
+        if self.decided == seg["id"] or seg["v"][0] == 0:
+            return
+        dt, target, pos, vel = game.meet(seg["p"], seg["v"])
+        when = seg["t"] + dt
+        if t < when:
+            return
+        self.decided = seg["id"]
+        mine = target == side
+        paddle = self._paddle(target, t if mine else when)
+        after = game.bounce(target, pos[1], paddle, vel)
+        if mine:
+            self.outbox.append({"hit": {"id": seg["id"], "paddle": paddle}} if after else {"miss": {"id": seg["id"]}})
+        if after:
+            self._switch({"id": seg["id"] + 1, "p": pos, "v": after, "t": when}, t, provisional=True)
+
+    def frame(self, t, d, ready=False):
+        """Advance to server time t with your key direction d; returns the state to draw."""
+        dt = 0.0 if self.t is None else max(0.0, t - self.t)  # real time: everything here is exact for any dt
+        self.t = t
+        snap, side = self.snap, self.side()
+        if side is not None:
+            if ready and snap["phase"] in ("serve", "over"):
+                self.outbox.append({"ready": True})
+            if d != self.mine["dir"]:
+                # computed from the key change and the clock, exactly as the other machines compute it
+                self.mine = {"y": paddle_at(self.mine, t), "dir": d, "t": t}
+                self.outbox.append({"paddle": self.mine})
+        if snap["phase"] == "playing":
+            self._contact(t, side)
+
+        fade = math.exp(-GLIDE_RATE * dt)
+        self.glide = [g * fade for g in self.glide]
+        ball, vel = self._ball(t)
+        paddles = [self._paddle(i, t) for i in range(len(snap["players"]))]
+        return {"players": snap["players"], "phase": snap["phase"], "ready": snap["ready"],
+                "score": snap["score"], "hits": snap["hits"] + self.provisional,
+                "ball": ball, "vel": vel, "paddles": paddles}
+
+
+class Link:
+    """The sockets: pings and messages out on a DEALER, snapshots in on a SUB."""
+
+    def __init__(self, name, host):
+        self.ctx = zmq.Context()
+        self.sub = self.ctx.socket(zmq.SUB)
+        self.sub.setsockopt(zmq.CONFLATE, 1)  # every snapshot is complete, so only the newest matters
+        self.sub.setsockopt(zmq.SUBSCRIBE, b"")
+        self.sub.connect(f"tcp://{host}:5555")
+        self.dealer = self.ctx.socket(zmq.DEALER)
+        self.dealer.setsockopt(zmq.IDENTITY, name.encode())
+        self.dealer.setsockopt(zmq.IMMEDIATE, 1)  # don't queue messages while the server is unreachable
+        self.dealer.connect(f"tcp://{host}:5556")
+        self.clock, self.rally = Clock(), Rally(name)
+        self.seq, self.next_ping = 0, 0.0
+
+    def send(self, msg):
+        self.seq += 1
+        try:
+            self.dealer.send_json({"seq": self.seq, "ts": time.time(), **msg}, zmq.NOBLOCK)
+        except zmq.Again:  # not connected (yet); a stale message is worthless, so drop it
+            pass
+
+    def update(self, d, ready=False):
+        """One frame: ping when due, take in replies and the newest snapshot, advance the rally.
+        Returns the state to draw, or None until the clock is synced and a snapshot has arrived."""
+        if time.perf_counter() >= self.next_ping:
+            self.send({"ping": time.perf_counter()})
+            self.next_ping = time.perf_counter() + PING_EVERY
+        while self.dealer.poll(0):
+            msg = self.dealer.recv_json()
+            if "pong" in msg:
+                self.clock.pong(msg["pong"], msg["t"], time.perf_counter())
+        t = None if self.clock.offset is None else time.perf_counter() + self.clock.offset
+        if self.sub.poll(0):
+            self.rally.receive(self.sub.recv_json(), t)
+        if t is None or self.rally.snap is None:
+            return None
+        shown = self.rally.frame(t, d, ready)
+        for msg in self.rally.outbox:
+            self.send(msg)
+        self.rally.outbox.clear()
+        return shown
+
+    def close(self):
+        self.ctx.destroy(linger=0)
 
 
 def draw(screen, state, view, me=None, fx=None):
@@ -255,38 +391,18 @@ def local(plain=False):
 
 
 def networked(name, host, plain=False):
-    ctx = zmq.Context()
-    sub = ctx.socket(zmq.SUB)
-    sub.setsockopt(zmq.CONFLATE, 1)  # keep only the newest state; must be set before connect
-    sub.setsockopt(zmq.SUBSCRIBE, b"")
-    sub.connect(f"tcp://{host}:5555")
-    dealer = ctx.socket(zmq.DEALER)
-    dealer.setsockopt(zmq.IDENTITY, name.encode())
-    dealer.setsockopt(zmq.IMMEDIATE, 1)  # don't queue inputs while the server is unreachable
-    dealer.connect(f"tcp://{host}:5556")
-
+    link = Link(name, host)
     screen, view = open_window(f"Pong: {name}")
     fx = None if plain else effects.FX(view)
     meow = load_meow()
     controls = "W / S or Up / Down to move     Esc to quit"
-    clock, seq = pygame.time.Clock(), 0
-    state, received, my_y, idle = None, 0.0, None, 0.0
+    clock, hits = pygame.time.Clock(), None
     try:
         while (pressed := read_events()) is not None:
-            dt = min(clock.tick(MAX_FPS) / 1000, MAX_DT)
+            clock.tick(MAX_FPS)
             keys = pygame.key.get_pressed()
             d = (keys[pygame.K_s] or keys[pygame.K_DOWN]) - (keys[pygame.K_w] or keys[pygame.K_UP])
-            seq += 1
-            try:
-                dealer.send_json({"seq": seq, "ts": time.time(), "dir": d, "ready": pygame.K_SPACE in pressed},
-                                 zmq.NOBLOCK)
-            except zmq.Again:  # not connected (yet); stale inputs are worthless, so drop it
-                pass
-            if sub.poll(0):
-                new = sub.recv_json()
-                if meow and state and new["hits"] > state["hits"]:
-                    meow.play()
-                state, received = new, time.perf_counter()
+            state = link.update(d, pygame.K_SPACE in pressed)
 
             if state is None:
                 start_screen(screen, view, f"Connecting to {host}...", controls, fx)
@@ -294,32 +410,26 @@ def networked(name, host, plain=False):
                 status = "You play left. Waiting for an opponent..." if state["players"] == [name] else "Joining..."
                 start_screen(screen, view, status, controls, fx)
             else:
+                if meow and hits is not None and state["hits"] > hits:
+                    meow.play()
+                hits = state["hits"]
                 players = state["players"]
                 side = players.index(name) if name in players else None
-                over = game.winner(state) is not None
-                shown = dict(state)
-                if not over:
-                    shown["ball"] = ball_ahead(state, time.perf_counter() - received)
-                if side is not None and not over:
-                    server_y = state["paddles"][side]
-                    idle = 0.0 if d else idle + dt
-                    my_y = predict_paddle(server_y if my_y is None else my_y, server_y, d, idle, dt)
-                    shown["paddles"] = list(state["paddles"])
-                    shown["paddles"][side] = my_y
-                else:
-                    my_y = None
-                draw(screen, shown, view, me=name, fx=fx)
-                if over:
+                draw(screen, state, view, me=name, fx=fx)
+                if game.winner(state) is not None:
                     end_screen(screen, view, state, players, "Space for a rematch     Esc to quit" if side is not None
                                else "Esc to quit", fx)
                 elif side is None:
                     banner(screen, view, "Watching: two players are already in")
-                elif state.get("phase") == "serve":
+                elif state["phase"] == "serve":
                     banner(screen, view, "Ready! Waiting for your opponent..." if state["ready"][side]
                            else "Press Space when ready")
+            if link.clock.rtt is not None:
+                label = view.fonts[1].render(f"ping {link.clock.rtt * 1000:.0f} ms", True, DIM)
+                screen.blit(label, label.get_rect(bottomleft=view.point(10, HEIGHT - 8)))
             pygame.display.flip()
     finally:
-        ctx.destroy(linger=0)
+        link.close()
 
 
 if __name__ == "__main__":

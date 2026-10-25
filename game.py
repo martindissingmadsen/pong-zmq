@@ -48,6 +48,45 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def face_x(side):
+    """x of the paddle face the ball meets on that side."""
+    return PADDLE_X[side] + (PADDLE_W / 2 if side == 0 else -PADDLE_W / 2)
+
+
+def bounce(side, y_hit, paddle_y, vel):
+    """The ball's velocity after meeting `side`'s paddle face at y_hit, or None for a miss.
+
+    Straight back from the paddle's centre, up to MAX_BOUNCE off the horizontal at its ends,
+    SPEEDUP faster, capped at MAX_SPEED."""
+    offset = (y_hit - paddle_y) / (PADDLE_H / 2 + R)
+    if abs(offset) > 1:
+        return None
+    speed = min(math.hypot(*vel) * SPEEDUP, MAX_SPEED)
+    angle = offset * MAX_BOUNCE
+    return [(1 if side == 0 else -1) * speed * math.cos(angle), speed * math.sin(angle)]
+
+
+def fly(ball, vel, dt):
+    """Position and velocity dt seconds on, bouncing off the top and bottom walls but not
+    paddles or goals. Exact for any dt, so every machine computes the same path."""
+    span = HEIGHT - 2 * R
+    p = (ball[1] - R + vel[1] * dt) % (2 * span)  # distance travelled, folded back at each wall
+    y, vy = (R + p, vel[1]) if p <= span else (R + 2 * span - p, -vel[1])
+    return [ball[0] + vel[0] * dt, y], [vel[0], vy]
+
+
+def meet(ball, vel):
+    """Where a ball flying from `ball` with `vel` meets the paddle face it is heading for:
+    (seconds until then, side, position, velocity there). None if it isn't moving sideways."""
+    if vel[0] == 0:
+        return None
+    side = 0 if vel[0] < 0 else 1
+    edge = ball[0] - R if side == 0 else ball[0] + R
+    dt = (face_x(side) - edge) / vel[0]
+    pos, v = fly(ball, vel, dt)
+    return dt, side, pos, v
+
+
 def step(state, dir_left, dir_right, dt):
     """Return the state dt seconds later. dir is -1 up, 0 still, 1 down. Works for any dt."""
     if winner(state) is not None:
@@ -68,18 +107,14 @@ def step(state, dir_left, dir_right, dt):
 
     hits = state["hits"]
     side = 0 if vx < 0 else 1
-    face = PADDLE_X[side] + (PADDLE_W / 2 if side == 0 else -PADDLE_W / 2)
+    face = face_x(side)
     edge0, edge = (x0 - R, x - R) if side == 0 else (x0 + R, x + R)
     # swept test: did the ball's leading edge cross the paddle face during this step?
     if (edge0 - face) * (edge - face) <= 0 and edge0 != edge:
         t = (face - edge0) / (edge - edge0)
         y_hit = y0 + (y - y0) * t
-        offset = (y_hit - paddles[side]) / (half + R)
-        if abs(offset) <= 1:
-            speed = min(math.hypot(vx, vy) * SPEEDUP, MAX_SPEED)
-            angle = offset * MAX_BOUNCE
-            vx = (1 if side == 0 else -1) * speed * math.cos(angle)
-            vy = speed * math.sin(angle)
+        if after := bounce(side, y_hit, paddles[side], (vx, vy)):
+            vx, vy = after
             x, y = face + (R if side == 0 else -R), y_hit
             hits += 1
 

@@ -5,26 +5,40 @@
 
 Networked, the client sends its input every frame and draws the newest state from
 the server; the first two names to join play left and right, later ones watch.
-Names must differ: the server tells players apart by name.
+Names must differ: the server tells players apart by name. To feel smooth between
+server states, it moves your own paddle as soon as you press a key and moves the
+ball forward from its last velocity.
+
+A cat meows on every paddle hit: assets/meow.wav when present, else a synthetic one.
 
 The window is sized to the screen and runs at the display's refresh rate
 (vsync); the local game steps with the real frame time. Cat sprites are optional:
 assets/cat_left.png and assets/cat_right.png are drawn over the paddles when present.
 """
+import io
+import math
 import sys
 import time
+import wave
+from array import array
 from pathlib import Path
 
 import pygame
 import zmq
 
 import game
-from game import BALL_SIZE, HEIGHT, PADDLE_H, PADDLE_W, PADDLE_X, WIDTH
+from game import BALL_SIZE, HEIGHT, PADDLE_H, PADDLE_SPEED, PADDLE_W, PADDLE_X, WIDTH
 
 MAX_FPS = 240  # vsync normally sets the pace; this only caps it when vsync is off
 MAX_DT = 1 / 30  # a stalled frame must not move the ball through a paddle
 ASSETS = Path(__file__).parent / "assets"
 BG, FG, DIM = (20, 20, 28), (235, 235, 235), (90, 90, 100)
+
+# smoothing between server states (networked only)
+SETTLE = 0.1  # s without input before your paddle eases back to where the server has it
+CORRECTION = 10  # per second: how fast it eases back
+SNAP = PADDLE_H / 2  # further off than this, jump straight to the server's position
+MAX_AHEAD = 0.1  # s; the ball is never moved forward further than this past the last state
 
 
 class View:
@@ -33,7 +47,10 @@ class View:
     def __init__(self, scale):
         self.scale = scale
         self.fonts = pygame.font.Font(None, round(72 * scale)), pygame.font.Font(None, round(28 * scale))
+        self.title = pygame.font.Font(None, round(180 * scale))
         self.cats = load_cats(PADDLE_H * scale)
+        self.shade = pygame.Surface((round(WIDTH * scale), round(HEIGHT * scale)), pygame.SRCALPHA)
+        self.shade.fill((*BG, 235))
 
     def point(self, x, y):
         return x * self.scale, y * self.scale
@@ -63,6 +80,59 @@ def load_cats(height):
     return cats
 
 
+def synth_meow(rate=22050, seconds=0.45):
+    """A synthetic meow as WAV bytes: a harmonic tone whose pitch rises and falls while
+    its bright "ee" fades into an "ow". Stand-in until we record our own cats."""
+    samples, phase, n = array("h"), 0.0, int(rate * seconds)
+    for i in range(n):
+        t = i / n
+        f0 = 420 + 380 * math.sin(math.pi * t ** 0.7) - 60 * t  # pitch: up, then down
+        formant = 2400 - 1600 * t  # vowel: ee -> ow
+        phase += 2 * math.pi * f0 / rate
+        weights = [math.exp(-((k * f0 - formant) / 600) ** 2) + 0.25 / k for k in range(1, 13)]
+        value = sum(w * math.sin(k * phase) for k, w in enumerate(weights, 1)) / sum(weights)
+        envelope = min(1, t / 0.08) * min(1, (1 - t) / 0.35)
+        samples.append(round(0.6 * 32767 * envelope * value))
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(samples.tobytes())
+    out.seek(0)
+    return out
+
+
+def load_meow():
+    """assets/meow.wav if we have one, else a synthetic meow. None without an audio device."""
+    path = ASSETS / "meow.wav"
+    try:
+        return pygame.mixer.Sound(path if path.exists() else synth_meow())
+    except pygame.error:
+        return None
+
+
+def predict_paddle(y, server_y, d, idle, dt):
+    """Your own paddle: moves with your input at once, like game.step will move it on the
+    server a moment later. Once you have let go for SETTLE seconds it eases back to the
+    server's position, and it jumps there if it is ever more than SNAP off."""
+    y = game.clamp(y + d * PADDLE_SPEED * dt, PADDLE_H / 2, HEIGHT - PADDLE_H / 2)
+    if abs(server_y - y) > SNAP:
+        return server_y
+    if idle >= SETTLE:
+        y += (server_y - y) * min(1, CORRECTION * dt)
+    return y
+
+
+def ball_ahead(state, age):
+    """The ball moved forward `age` seconds from its last velocity, bouncing as in game.step.
+    Never past a goal: scoring is the server's call, so then it stays where the state has it."""
+    if age <= 0:
+        return state["ball"]
+    ahead = game.step(state, 0, 0, min(age, MAX_AHEAD))
+    return ahead["ball"] if ahead["score"] == state["score"] else state["ball"]
+
+
 def draw(screen, state, view, me=None):
     screen.fill(BG)
     for y in range(0, HEIGHT, 30):
@@ -87,13 +157,33 @@ def draw(screen, state, view, me=None):
     # drawn round, but the hitbox is still the BALL_SIZE square
     pygame.draw.aacircle(screen, FG, view.point(*state["ball"]), BALL_SIZE / 2 * view.scale)
 
-    if (side := game.winner(state)) is not None:
-        banner(screen, view, f"{(players or ['Left', 'Right'])[side]} wins")
+
+def text(screen, view, font, line, colour, y):
+    label = font.render(line, True, colour)
+    screen.blit(label, label.get_rect(center=view.point(WIDTH / 2, y)))
 
 
-def banner(screen, view, text):
-    label = view.fonts[1].render(text, True, FG)
-    screen.blit(label, label.get_rect(center=view.point(WIDTH / 2, HEIGHT * 2 / 3)))
+def banner(screen, view, line):
+    text(screen, view, view.fonts[1], line, FG, HEIGHT * 2 / 3)
+
+
+def start_screen(screen, view, status, hint):
+    screen.fill(BG)
+    text(screen, view, view.title, "PONG", FG, 200)
+    for cat, x in zip(view.cats, (WIDTH / 2 - 230, WIDTH / 2 + 230)):
+        if cat:
+            screen.blit(cat, cat.get_rect(center=view.point(x, 200)))
+    text(screen, view, view.fonts[1], status, FG, 360)
+    text(screen, view, view.fonts[1], hint, DIM, 410)
+
+
+def end_screen(screen, view, state, players, hint):
+    """Drawn over the final state of the match."""
+    side = game.winner(state)
+    screen.blit(view.shade, (0, 0))
+    text(screen, view, view.fonts[0], f"{players[side]} wins", FG, 250)
+    text(screen, view, view.fonts[1], f"{state['score'][0]} - {state['score'][1]}", FG, 310)
+    text(screen, view, view.fonts[1], hint, DIM, 400)
 
 
 def open_window(title):
@@ -108,21 +198,39 @@ def open_window(title):
     return screen, View(scale)
 
 
-def quit_requested():
-    return any(event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE)
-               for event in pygame.event.get())
+def read_events():
+    """Keys pressed since the last frame, or None when the window should close."""
+    pressed = []
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+            return None
+        if event.type == pygame.KEYDOWN:
+            pressed.append(event.key)
+    return pressed
 
 
 def local():
     screen, view = open_window("Pong")
-    state = game.new_state()
+    meow = load_meow()
+    names = ["W / S", "Up / Down"]
+    state, playing = game.new_state(), False
     clock = pygame.time.Clock()
-    while not quit_requested():
+    while (pressed := read_events()) is not None:
         dt = min(clock.tick(MAX_FPS) / 1000, MAX_DT)
-        keys = pygame.key.get_pressed()
-        state = game.step(state, keys[pygame.K_s] - keys[pygame.K_w],
-                          keys[pygame.K_DOWN] - keys[pygame.K_UP], dt)
-        draw(screen, {**state, "players": ["W / S", "Up / Down"]}, view)
+        if pygame.K_SPACE in pressed and (not playing or game.winner(state) is not None):
+            state, playing = game.new_state(), True
+        if not playing:
+            start_screen(screen, view, "Press Space to start", "Left: W / S     Right: Up / Down     Esc: quit")
+        else:
+            keys = pygame.key.get_pressed()
+            hits = state["hits"]
+            state = game.step(state, keys[pygame.K_s] - keys[pygame.K_w],
+                              keys[pygame.K_DOWN] - keys[pygame.K_UP], dt)
+            if meow and state["hits"] > hits:
+                meow.play()
+            draw(screen, {**state, "players": names}, view)
+            if game.winner(state) is not None:
+                end_screen(screen, view, state, names, "Space for a rematch     Esc to quit")
         pygame.display.flip()
 
 
@@ -138,29 +246,50 @@ def networked(name, host):
     dealer.connect(f"tcp://{host}:5556")
 
     screen, view = open_window(f"Pong: {name}")
-    clock, seq, state = pygame.time.Clock(), 0, None
+    meow = load_meow()
+    controls = "W / S or Up / Down to move     Esc to quit"
+    clock, seq = pygame.time.Clock(), 0
+    state, received, my_y, idle = None, 0.0, None, 0.0
     try:
-        while not quit_requested():
-            clock.tick(MAX_FPS)
+        while read_events() is not None:
+            dt = min(clock.tick(MAX_FPS) / 1000, MAX_DT)
             keys = pygame.key.get_pressed()
+            d = (keys[pygame.K_s] or keys[pygame.K_DOWN]) - (keys[pygame.K_w] or keys[pygame.K_UP])
             seq += 1
             try:
-                dealer.send_json({"seq": seq, "ts": time.time(),
-                                  "dir": (keys[pygame.K_s] or keys[pygame.K_DOWN]) - (keys[pygame.K_w] or keys[pygame.K_UP])},
-                                 zmq.NOBLOCK)
+                dealer.send_json({"seq": seq, "ts": time.time(), "dir": d}, zmq.NOBLOCK)
             except zmq.Again:  # not connected (yet); stale inputs are worthless, so drop it
                 pass
             if sub.poll(0):
-                state = sub.recv_json()
+                new = sub.recv_json()
+                if meow and state and new["hits"] > state["hits"]:
+                    meow.play()
+                state, received = new, time.perf_counter()
 
             if state is None:
-                screen.fill(BG)
-                banner(screen, view, f"Connecting to {host}...")
+                start_screen(screen, view, f"Connecting to {host}...", controls)
+            elif len(state["players"]) < 2:
+                status = "You play left. Waiting for an opponent..." if state["players"] == [name] else "Joining..."
+                start_screen(screen, view, status, controls)
             else:
-                draw(screen, state, view, me=name)
-                if len(state["players"]) < 2:
-                    banner(screen, view, "Waiting for an opponent")
-                elif name not in state["players"]:
+                players = state["players"]
+                side = players.index(name) if name in players else None
+                over = game.winner(state) is not None
+                shown = dict(state)
+                if not over:
+                    shown["ball"] = ball_ahead(state, time.perf_counter() - received)
+                if side is not None and not over:
+                    server_y = state["paddles"][side]
+                    idle = 0.0 if d else idle + dt
+                    my_y = predict_paddle(server_y if my_y is None else my_y, server_y, d, idle, dt)
+                    shown["paddles"] = list(state["paddles"])
+                    shown["paddles"][side] = my_y
+                else:
+                    my_y = None
+                draw(screen, shown, view, me=name)
+                if over:
+                    end_screen(screen, view, state, players, "Esc to quit")
+                elif side is None:
                     banner(screen, view, "Watching: two players are already in")
             pygame.display.flip()
     finally:

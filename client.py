@@ -214,23 +214,31 @@ def local():
     meow = load_meow()
     names = ["W / S", "Up / Down"]
     state, playing = game.new_state(), False
+    held = None  # after a goal: the serve velocity, kept while the ball waits in the centre for Space
     clock = pygame.time.Clock()
     while (pressed := read_events()) is not None:
         dt = min(clock.tick(MAX_FPS) / 1000, MAX_DT)
-        if pygame.K_SPACE in pressed and (not playing or game.winner(state) is not None):
-            state, playing = game.new_state(), True
+        if pygame.K_SPACE in pressed:
+            if not playing or game.winner(state) is not None:
+                state, playing, held = game.new_state(), True, None
+            elif held:
+                state, held = {**state, "vel": held}, None
         if not playing:
             start_screen(screen, view, "Press Space to start", "Left: W / S     Right: Up / Down     Esc: quit")
         else:
             keys = pygame.key.get_pressed()
-            hits = state["hits"]
+            hits, score = state["hits"], state["score"]
             state = game.step(state, keys[pygame.K_s] - keys[pygame.K_w],
                               keys[pygame.K_DOWN] - keys[pygame.K_UP], dt)
             if meow and state["hits"] > hits:
                 meow.play()
+            if state["score"] != score and game.winner(state) is None:
+                held, state = state["vel"], {**state, "vel": [0, 0]}  # like the server: every ball waits for Space
             draw(screen, {**state, "players": names}, view)
             if game.winner(state) is not None:
                 end_screen(screen, view, state, names, "Space for a rematch     Esc to quit")
+            elif held:
+                banner(screen, view, "Press Space to serve")
         pygame.display.flip()
 
 
@@ -251,13 +259,14 @@ def networked(name, host):
     clock, seq = pygame.time.Clock(), 0
     state, received, my_y, idle = None, 0.0, None, 0.0
     try:
-        while read_events() is not None:
+        while (pressed := read_events()) is not None:
             dt = min(clock.tick(MAX_FPS) / 1000, MAX_DT)
             keys = pygame.key.get_pressed()
             d = (keys[pygame.K_s] or keys[pygame.K_DOWN]) - (keys[pygame.K_w] or keys[pygame.K_UP])
             seq += 1
             try:
-                dealer.send_json({"seq": seq, "ts": time.time(), "dir": d}, zmq.NOBLOCK)
+                dealer.send_json({"seq": seq, "ts": time.time(), "dir": d, "ready": pygame.K_SPACE in pressed},
+                                 zmq.NOBLOCK)
             except zmq.Again:  # not connected (yet); stale inputs are worthless, so drop it
                 pass
             if sub.poll(0):
@@ -288,9 +297,13 @@ def networked(name, host):
                     my_y = None
                 draw(screen, shown, view, me=name)
                 if over:
-                    end_screen(screen, view, state, players, "Esc to quit")
+                    end_screen(screen, view, state, players, "Space for a rematch     Esc to quit" if side is not None
+                               else "Esc to quit")
                 elif side is None:
                     banner(screen, view, "Watching: two players are already in")
+                elif state.get("phase") == "serve":
+                    banner(screen, view, "Ready! Waiting for your opponent..." if state["ready"][side]
+                           else "Press Space when ready")
             pygame.display.flip()
     finally:
         ctx.destroy(linger=0)

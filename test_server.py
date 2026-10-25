@@ -127,6 +127,21 @@ class TestMatch(unittest.TestCase):
         both_ready(match, now=now + 0.1)
         self.assertEqual((match.phase, match.score, match.hits), ("playing", [0, 0], 0))
 
+    def test_logs_joins_calls_with_their_delay_and_the_result(self):
+        rows = []
+        match = Match(log=lambda *row: rows.append(row))
+        match.on_message("clara", {}, 0)
+        match.on_message("martin", {}, 0)
+        match.score = [10, 0]
+        seg_id, contact = heading_left(match, y=300)
+        match.on_message("clara", {"hit": {"id": seg_id, "paddle": 300}}, contact + 0.03)
+        dt = game.meet(match.seg["p"], match.seg["v"])[0]
+        late = match.seg["t"] + dt + 0.05
+        match.on_message("martin", {"miss": {"id": match.seg["id"]}}, late)
+        self.assertEqual(rows, [(0, "join", "clara", "", "", "left"), (0, "join", "martin", "", "", "right"),
+                                (contact + 0.03, "hit", "clara", "", "", 0.03),
+                                (late, "miss", "martin", "", "", 0.05), (late, "over", "clara", "", "", "11-0")])
+
     def test_silent_player_is_dropped_and_the_match_resets(self):
         match = two_players()
         match.score = [3, 2]

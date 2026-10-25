@@ -3,6 +3,9 @@
     python client.py                local game, two players on one keyboard: W/S (left), Up/Down (right)
     python client.py NAME [HOST]    networked: join server.py on HOST (default localhost), W/S or Up/Down
 
+Add --plain to either for the flat look without effects.py (glow, particles, shake),
+e.g. for experiments where only the network should cost time.
+
 Networked, the client sends its input every frame and draws the newest state from
 the server; the first two names to join play left and right, later ones watch.
 Names must differ: the server tells players apart by name. To feel smooth between
@@ -26,6 +29,7 @@ from pathlib import Path
 import pygame
 import zmq
 
+import effects
 import game
 from game import BALL_SIZE, HEIGHT, PADDLE_H, PADDLE_SPEED, PADDLE_W, PADDLE_X, WIDTH
 
@@ -46,6 +50,7 @@ class View:
 
     def __init__(self, scale):
         self.scale = scale
+        self.offset = (0, 0)  # in pixels; effects.py shakes the field by moving this
         self.fonts = pygame.font.Font(None, round(72 * scale)), pygame.font.Font(None, round(28 * scale))
         self.title = pygame.font.Font(None, round(180 * scale))
         self.cats = load_cats(PADDLE_H * scale)
@@ -53,7 +58,7 @@ class View:
         self.shade.fill((*BG, 235))
 
     def point(self, x, y):
-        return x * self.scale, y * self.scale
+        return x * self.scale + self.offset[0], y * self.scale + self.offset[1]
 
     def box(self, cx, cy, w, h):
         rect = pygame.FRect(0, 0, w * self.scale, h * self.scale)
@@ -133,7 +138,9 @@ def ball_ahead(state, age):
     return ahead["ball"] if ahead["score"] == state["score"] else state["ball"]
 
 
-def draw(screen, state, view, me=None):
+def draw(screen, state, view, me=None, fx=None):
+    if fx:
+        return fx.draw(screen, state, me)
     screen.fill(BG)
     for y in range(0, HEIGHT, 30):
         pygame.draw.rect(screen, DIM, view.box(WIDTH / 2, y + 10, 4, 16))
@@ -167,7 +174,9 @@ def banner(screen, view, line):
     text(screen, view, view.fonts[1], line, FG, HEIGHT * 2 / 3)
 
 
-def start_screen(screen, view, status, hint):
+def start_screen(screen, view, status, hint, fx=None):
+    if fx:
+        return fx.start_screen(screen, status, hint)
     screen.fill(BG)
     text(screen, view, view.title, "PONG", FG, 200)
     for cat, x in zip(view.cats, (WIDTH / 2 - 230, WIDTH / 2 + 230)):
@@ -177,8 +186,10 @@ def start_screen(screen, view, status, hint):
     text(screen, view, view.fonts[1], hint, DIM, 410)
 
 
-def end_screen(screen, view, state, players, hint):
+def end_screen(screen, view, state, players, hint, fx=None):
     """Drawn over the final state of the match."""
+    if fx:
+        return fx.end_overlay(screen, state, players, hint)
     side = game.winner(state)
     screen.blit(view.shade, (0, 0))
     text(screen, view, view.fonts[0], f"{players[side]} wins", FG, 250)
@@ -209,8 +220,9 @@ def read_events():
     return pressed
 
 
-def local():
+def local(plain=False):
     screen, view = open_window("Pong")
+    fx = None if plain else effects.FX(view)
     meow = load_meow()
     names = ["W / S", "Up / Down"]
     state, playing = game.new_state(), False
@@ -224,7 +236,7 @@ def local():
             elif held:
                 state, held = {**state, "vel": held}, None
         if not playing:
-            start_screen(screen, view, "Press Space to start", "Left: W / S     Right: Up / Down     Esc: quit")
+            start_screen(screen, view, "Press Space to start", "Left: W / S     Right: Up / Down     Esc: quit", fx)
         else:
             keys = pygame.key.get_pressed()
             hits, score = state["hits"], state["score"]
@@ -234,15 +246,15 @@ def local():
                 meow.play()
             if state["score"] != score and game.winner(state) is None:
                 held, state = state["vel"], {**state, "vel": [0, 0]}  # like the server: every ball waits for Space
-            draw(screen, {**state, "players": names}, view)
+            draw(screen, {**state, "players": names}, view, fx=fx)
             if game.winner(state) is not None:
-                end_screen(screen, view, state, names, "Space for a rematch     Esc to quit")
+                end_screen(screen, view, state, names, "Space for a rematch     Esc to quit", fx)
             elif held:
                 banner(screen, view, "Press Space to serve")
         pygame.display.flip()
 
 
-def networked(name, host):
+def networked(name, host, plain=False):
     ctx = zmq.Context()
     sub = ctx.socket(zmq.SUB)
     sub.setsockopt(zmq.CONFLATE, 1)  # keep only the newest state; must be set before connect
@@ -254,6 +266,7 @@ def networked(name, host):
     dealer.connect(f"tcp://{host}:5556")
 
     screen, view = open_window(f"Pong: {name}")
+    fx = None if plain else effects.FX(view)
     meow = load_meow()
     controls = "W / S or Up / Down to move     Esc to quit"
     clock, seq = pygame.time.Clock(), 0
@@ -276,10 +289,10 @@ def networked(name, host):
                 state, received = new, time.perf_counter()
 
             if state is None:
-                start_screen(screen, view, f"Connecting to {host}...", controls)
+                start_screen(screen, view, f"Connecting to {host}...", controls, fx)
             elif len(state["players"]) < 2:
                 status = "You play left. Waiting for an opponent..." if state["players"] == [name] else "Joining..."
-                start_screen(screen, view, status, controls)
+                start_screen(screen, view, status, controls, fx)
             else:
                 players = state["players"]
                 side = players.index(name) if name in players else None
@@ -295,10 +308,10 @@ def networked(name, host):
                     shown["paddles"][side] = my_y
                 else:
                     my_y = None
-                draw(screen, shown, view, me=name)
+                draw(screen, shown, view, me=name, fx=fx)
                 if over:
                     end_screen(screen, view, state, players, "Space for a rematch     Esc to quit" if side is not None
-                               else "Esc to quit")
+                               else "Esc to quit", fx)
                 elif side is None:
                     banner(screen, view, "Watching: two players are already in")
                 elif state.get("phase") == "serve":
@@ -310,11 +323,13 @@ def networked(name, host):
 
 
 if __name__ == "__main__":
+    plain = "--plain" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--plain"]
     try:
-        if len(sys.argv) == 1:
-            local()
-        elif len(sys.argv) in (2, 3):
-            networked(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else "localhost")
+        if not args:
+            local(plain)
+        elif len(args) in (1, 2):
+            networked(args[0], args[1] if len(args) == 2 else "localhost", plain)
         else:
             print(__doc__)
     except KeyboardInterrupt:

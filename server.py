@@ -207,7 +207,7 @@ def run(pub, router, log):
         if match.changed or now >= next_snapshot:
             seq += 1
             ts = time.time()
-            raw = zmq.utils.jsonapi.dumps({"seq": seq, "ts": ts, **match.message()})
+            raw = zmq.utils.jsonapi.dumps({"seq": seq, "ts": ts, "t": time.perf_counter(), **match.message()})
             pub.send(raw)
             log(now, "snapshot", "", seq, ts, len(raw))
             match.changed, next_snapshot = False, now + SNAPSHOT_EVERY

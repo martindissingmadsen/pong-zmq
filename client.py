@@ -4,7 +4,8 @@
     python client.py NAME [HOST]    networked: join server.py on HOST (default localhost), W/S or Up/Down
 
 Add --plain to either for the flat look without effects.py (glow, particles, shake),
-e.g. for experiments where only the network should cost time.
+e.g. for experiments where only the network should cost time. Add --log to a networked
+client to write CSV logs to logs/ (see telemetry.py).
 
 Networked, the first two names to join play left and right, later ones watch. Names
 must differ: the server tells players apart by name. Messages only flow when something
@@ -37,6 +38,7 @@ import zmq
 
 import effects
 import game
+import telemetry
 from game import BALL_SIZE, HEIGHT, PADDLE_H, PADDLE_W, PADDLE_X, WIDTH
 
 MAX_FPS = 240  # vsync normally sets the pace; this only caps it when vsync is off
@@ -157,13 +159,16 @@ class Rally:
         self.glide = [0.0, 0.0]  # display offset that fades out after a correction
         self.paddle_glide = [0.0, 0.0]  # the same for each opponent paddle when its key change arrives
         self.outbox = []
+        self.pending = {}  # segment id -> a contact we called or predicted, until the server answers
+        self.events = []  # rows for telemetry: ("contacts", server time, ...)
 
     def side(self):
         players = self.snap["players"]
         return players.index(self.name) if self.name in players else None
 
-    def receive(self, snap, t):
-        """A snapshot from the server. t is the server time now, or None before the clock is synced."""
+    def receive(self, snap, t, arrived=None):
+        """A snapshot from the server. t is the server time now, or None before the clock is synced;
+        `arrived` is when it actually arrived (server time), if known, for the contact log."""
         old, self.snap = self.snap, snap
         if old is not None and t is not None and old["players"] == snap["players"]:
             # an opponent's key change arrives a network delay late: glide there instead of jumping
@@ -172,16 +177,29 @@ class Rally:
                 self.paddle_glide[i] = gap if abs(gap) < PADDLE_GLIDE_MAX else 0.0
         else:
             self.paddle_glide = [0.0, 0.0]
-        seg = snap["seg"]
+        seg, correction = snap["seg"], 0.0
         if self.seg is None or seg["id"] > self.seg["id"] or (seg["id"] == self.seg["id"] and self.provisional):
-            self._switch(seg, t, provisional=False)
+            correction = self._switch(seg, t, provisional=False)
+        for seg_id in [i for i in self.pending if i < seg["id"]]:  # the server has moved past these
+            c = self.pending.pop(seg_id)
+            outcome = "hit" if snap["score"] == c["score"] else "goal"
+            answer = arrived if arrived is not None else t
+            self.events.append(("contacts", t, seg_id, c["side"], int(c["mine"]), c["call"],
+                                1000 * (c["noticed"] - c["contact"]),
+                                None if answer is None else 1000 * (answer - c["contact"]),
+                                outcome, int((c["call"] == "hit") == (outcome == "hit")),
+                                correction if outcome == "hit" else None))  # after a goal the ball is reset anyway
 
     def _switch(self, seg, t, provisional):
-        """Follow a new segment, gliding from where the ball is drawn now unless that is far off."""
+        """Follow a new segment, gliding from where the ball is drawn now unless that is far off.
+        Returns how far the path we followed was from the new one right now, in units."""
+        error = 0.0
         if self.seg is not None and t is not None:
             gap = [a - b for a, b in zip(self._ball(t)[0], path(seg, t)[0])]
             self.glide = gap if math.hypot(*gap) < GLIDE_MAX else [0.0, 0.0]
+            error = math.dist(path(self.seg, t)[0], path(seg, t)[0])  # leaving out any glide still on screen
         self.seg, self.provisional = seg, provisional
+        return error
 
     def _ball(self, t):
         (x, y), vel = path(self.seg, t)
@@ -211,6 +229,8 @@ class Rally:
         mine = target == side
         paddle = self._paddle(target, when)  # at the moment of contact, not this (later) frame
         after = game.bounce(target, pos[1], paddle, vel)
+        self.pending[seg["id"]] = {"side": target, "mine": mine, "call": "hit" if after else "miss",
+                                   "contact": when, "noticed": t, "score": list(self.snap["score"])}
         if mine:
             self.outbox.append({"hit": {"id": seg["id"], "paddle": paddle}} if after else {"miss": {"id": seg["id"]}})
         if after:
@@ -242,46 +262,62 @@ class Rally:
 
 
 class Link:
-    """The sockets: snapshots in on a SUB, everything else through a DEALER that a small thread owns.
+    """The sockets, owned by a small thread: snapshots in on a SUB, everything else through a DEALER.
 
-    The thread sends the pings itself and timestamps each pong the moment it arrives. Done
-    in the game loop, both would wait for the next frame, which on one machine turned a
-    sub-millisecond round trip into about 8 ms at 120 fps, and pulled the clock 4 ms late."""
+    The thread sends the pings itself and timestamps each pong and snapshot the moment it
+    arrives. Done in the game loop, they would wait for the next frame, which on one machine
+    turned a sub-millisecond round trip into about 8 ms at 120 fps, and pulled the clock 4 ms
+    late. With `log_dir`, everything measured goes to CSV files (see telemetry.py)."""
 
-    def __init__(self, name, host):
+    def __init__(self, name, host, log_dir=None):
         self.ctx = zmq.Context()
-        self.sub = self.ctx.socket(zmq.SUB)
-        self.sub.setsockopt(zmq.CONFLATE, 1)  # every snapshot is complete, so only the newest matters
-        self.sub.setsockopt(zmq.SUBSCRIBE, b"")
-        self.sub.connect(f"tcp://{host}:{STATE_PORT}")
         self.pipe = self.ctx.socket(zmq.PAIR)  # game loop -> thread; wakes the thread at once
         address = f"inproc://link-{id(self)}"
         self.pipe.bind(address)
-        self.pongs = queue.SimpleQueue()  # thread -> game loop: (sent, server time, received)
-        self.clock, self.rally = Clock(), Rally(name)
+        self.snapshots = queue.SimpleQueue()  # thread -> game loop: (snapshot, arrival time)
+        self.clock, self.rally = Clock(), Rally(name)  # the thread feeds the clock; the game loop reads it
         self.seq = 0  # messages sent so far, counted by the thread
+        self.traffic = [0, 0, 0, 0]  # messages out, messages in, bytes out, bytes in, counted by the thread
         self.paddle = None  # our paddle as of the last frame, resent with every ping; None while watching
+        self.recorder = telemetry.Recorder(log_dir, name) if log_dir else None
+        self.last_frame = None
         self.thread = threading.Thread(target=self._talk, args=(name, host, address), daemon=True)
         self.thread.start()
 
     def _talk(self, name, host, address):
-        """The thread: forwards the game loop's messages, pings on time, timestamps pongs on arrival."""
+        """The thread: forwards the game loop's messages, pings on time, timestamps what arrives."""
         pipe = self.ctx.socket(zmq.PAIR)
         pipe.connect(address)
+        sub = self.ctx.socket(zmq.SUB)
+        sub.setsockopt(zmq.CONFLATE, 1)  # every snapshot is complete, so only the newest matters
+        sub.setsockopt(zmq.SUBSCRIBE, b"")
+        sub.connect(f"tcp://{host}:{STATE_PORT}")
         dealer = self.ctx.socket(zmq.DEALER)
         dealer.setsockopt(zmq.IDENTITY, name.encode())
         dealer.setsockopt(zmq.IMMEDIATE, 1)  # don't queue messages while the server is unreachable
         dealer.connect(f"tcp://{host}:{INPUT_PORT}")
         poller = zmq.Poller()
-        poller.register(pipe, zmq.POLLIN)
-        poller.register(dealer, zmq.POLLIN)
+        for socket in (pipe, sub, dealer):
+            poller.register(socket, zmq.POLLIN)
+        recorder, last_seq = self.recorder, None
 
         def send(msg):
             self.seq += 1
+            raw = json.dumps({"seq": self.seq, "ts": time.time(), **msg}).encode()
             try:
-                dealer.send_json({"seq": self.seq, "ts": time.time(), **msg}, zmq.NOBLOCK)
+                dealer.send(raw, zmq.NOBLOCK)
+                self.traffic[0] += 1
+                self.traffic[2] += len(raw)
             except zmq.Again:  # not connected (yet); a stale message is worthless, so drop it
                 pass
+
+        def arrived(raw):
+            """Timestamp first, before parsing; returns (message, arrival time, our server-time estimate)."""
+            received = time.perf_counter()
+            self.traffic[1] += 1
+            self.traffic[3] += len(raw)
+            offset = self.clock.offset
+            return json.loads(raw), received, None if offset is None else received + offset
 
         next_ping = time.perf_counter()
         try:
@@ -295,11 +331,24 @@ class Link:
                 ready = dict(poller.poll(wait * 1000))
                 if dealer in ready:
                     while dealer.poll(0):
-                        raw = dealer.recv()
-                        received = time.perf_counter()  # before anything else, parsing included
-                        msg = json.loads(raw)
+                        msg, received, _ = arrived(dealer.recv())
                         if "pong" in msg:
-                            self.pongs.put((msg["pong"], msg["t"], received))
+                            self.clock.pong(msg["pong"], msg["t"], received)
+                            if recorder:
+                                sample = msg["t"] - (msg["pong"] + received) / 2
+                                recorder.row("pings", received + self.clock.offset, 1000 * self.clock.rtt,
+                                             1000 * sample, 1000 * self.clock.offset)
+                if sub in ready:
+                    while sub.poll(0):
+                        raw = sub.recv()
+                        snap, received, server_t = arrived(raw)
+                        self.snapshots.put((snap, received))
+                        if recorder:
+                            skipped = None if last_seq is None else snap["seq"] - last_seq - 1
+                            latency = None if server_t is None or "t" not in snap else 1000 * (server_t - snap["t"])
+                            recorder.row("snapshots", server_t, snap["seq"], skipped, len(raw), latency,
+                                         snap["phase"], *snap["score"], snap["hits"], snap["seg"]["id"])
+                        last_seq = snap["seq"]
                 if pipe in ready:
                     while pipe.poll(0):
                         raw = pipe.recv()
@@ -307,23 +356,29 @@ class Link:
                             return
                         send(json.loads(raw))
         finally:
-            dealer.close(linger=0)
-            pipe.close(linger=0)
+            for socket in (dealer, sub, pipe):
+                socket.close(linger=0)
 
     def send(self, msg):
         self.pipe.send_json(msg)
 
     def update(self, d, ready=False):
-        """One frame: take in the clock samples and the newest snapshot, advance the rally.
+        """One frame: take in the newest snapshot, advance the rally, log.
         Returns the state to draw, or None until the clock is synced and a snapshot has arrived."""
+        now = time.perf_counter()
+        interval, self.last_frame = (None if self.last_frame is None else now - self.last_frame), now
+        newest = None
         while True:
             try:
-                self.clock.pong(*self.pongs.get_nowait())
+                newest = self.snapshots.get_nowait()
             except queue.Empty:
                 break
         t = None if self.clock.offset is None else time.perf_counter() + self.clock.offset
-        if self.sub.poll(0):
-            self.rally.receive(self.sub.recv_json(), t)
+        if newest:
+            snap, received = newest
+            self.rally.receive(snap, t, None if t is None else received + self.clock.offset)
+        if self.recorder:
+            self.recorder.frame(interval, t, tuple(self.traffic), self.clock)
         if t is None or self.rally.snap is None:
             return None
         shown = self.rally.frame(t, d, ready)
@@ -333,12 +388,18 @@ class Link:
         for msg in self.rally.outbox:
             self.send(msg)
         self.rally.outbox.clear()
+        if self.recorder:
+            for kind, server_t, *values in self.rally.events:
+                self.recorder.row(kind, server_t, *values)
+        self.rally.events.clear()
         return shown
 
     def close(self):
         self.pipe.send(b"")
         self.thread.join(timeout=1)
         self.ctx.destroy(linger=0)
+        if self.recorder:
+            self.recorder.close()
 
 
 def draw(screen, state, view, me=None, fx=None):
@@ -457,8 +518,8 @@ def local(plain=False):
         pygame.display.flip()
 
 
-def networked(name, host, plain=False):
-    link = Link(name, host)
+def networked(name, host, plain=False, log_dir=None):
+    link = Link(name, host, log_dir)
     screen, view = open_window(f"Pong: {name}")
     fx = None if plain else effects.FX(view)
     meow = load_meow()
@@ -500,13 +561,13 @@ def networked(name, host, plain=False):
 
 
 if __name__ == "__main__":
-    plain = "--plain" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--plain"]
+    plain, log = "--plain" in sys.argv, "--log" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
     try:
         if not args:
             local(plain)
         elif len(args) in (1, 2):
-            networked(args[0], args[1] if len(args) == 2 else "localhost", plain)
+            networked(args[0], args[1] if len(args) == 2 else "localhost", plain, "logs" if log else None)
         else:
             print(__doc__)
     except KeyboardInterrupt:

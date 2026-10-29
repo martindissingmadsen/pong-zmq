@@ -16,10 +16,18 @@ pings five times a second (clock sync, and the heartbeat that detects a lost pla
 Every ball still waits in the centre until both players have pressed Space: the first
 serve, the serve after each point and a rematch. Ports: PUB :5555 for snapshots, ROUTER
 :5556 for client messages and ping replies.
+
+Every run logs to logs/server-<date>-<time>.csv, one row per event (LOG_FIELDS); `t` is server
+time. recv: a client message (its seq, its ts, which kinds it carried). snapshot: one sent (its
+seq, ts and size in bytes). join, leave. hit and miss: the defender's call, with how many seconds
+after the contact it arrived. over: the winner and the final score.
 """
+import csv
 import math
+import os
 import random
 import time
+from pathlib import Path
 
 import zmq
 
@@ -32,12 +40,16 @@ SNAPSHOT_EVERY = 1.0  # s; also sent on every change, this only catches up late 
 POLL_MS = 20  # how often the loop wakes up to check timeouts when nothing arrives
 PADDLE_CLOCK_SLACK = 0.5  # s; a paddle change may say it happened at most this long ago
 CENTRE = [WIDTH / 2, HEIGHT / 2]
+LOG_DIR = Path(os.environ.get("PONG_LOG_DIR", Path(__file__).parent / "logs"))  # experiments point this elsewhere
+LOG_FIELDS = ("t", "event", "player", "seq", "ts", "value")
+KINDS = ("ping", "paddle", "hit", "miss", "ready")  # what a client message can carry
 
 
 class Match:
     """Who is playing, the score and the ball's current segment. No sockets, so it can be unit tested."""
 
-    def __init__(self, now=0.0):
+    def __init__(self, now=0.0, log=None):
+        self.log = log or (lambda *row: None)  # called with one LOG_FIELDS row per event
         self.players, self.seen, self.ready = [], {}, set()
         self.paddles = {}  # name -> {"y", "dir", "t"}: position at server time t, then moving with dir
         self.seg_id = 0  # never reset, so clients can always tell a newer segment from an older one
@@ -78,7 +90,9 @@ class Match:
             self.players.append(name)
             self.paddles[name] = {"y": HEIGHT / 2, "dir": 0, "t": now}
             self.changed = True
-            print(f"joined: {name} ({'left' if len(self.players) == 1 else 'right'})")
+            side = "left" if len(self.players) == 1 else "right"
+            print(f"joined: {name} ({side})")
+            self.log(now, "join", name, "", "", side)
         self.seen[name] = now
         side = self.players.index(name)
 
@@ -110,15 +124,18 @@ class Match:
             return  # only the side the ball is heading for gets to decide
         half = PADDLE_H / 2
         after = game.bounce(side, pos[1], game.clamp(paddle_y, half, HEIGHT - half), vel) if number(paddle_y) else None
+        contact = self.seg["t"] + dt
+        self.log(now, "hit" if after else "miss", self.players[side], "", "", round(now - contact, 6))
         if after:
             self.hits += 1
-            self.new_segment(pos, after, self.seg["t"] + dt)
+            self.new_segment(pos, after, contact)
             return
         scorer = 1 - side
         self.score = [s + (i == scorer) for i, s in enumerate(self.score)]
         print(f"score {self.score[0]}-{self.score[1]}")
         if game.winner({"score": self.score}) is not None:
             print(f"{self.players[scorer]} wins")
+            self.log(now, "over", self.players[scorer], "", "", f"{self.score[0]}-{self.score[1]}")
             self.serve_vel = None
             self.new_segment(CENTRE, [0, 0], now)
             self.ready.clear()
@@ -130,6 +147,7 @@ class Match:
             self.players.remove(name)
             del self.seen[name], self.paddles[name]
             print(f"left: {name} (nothing heard for {TIMEOUT:g} s)")
+            self.log(now, "leave", name, "", "", "timeout")
             self.reset(now)  # a fresh match once two players are in again
 
         phase = self.phase
@@ -154,14 +172,20 @@ def serve():
     router = ctx.socket(zmq.ROUTER)
     router.setsockopt(zmq.ROUTER_HANDOVER, 1)  # a client reconnecting under the same name takes over its old slot
     router.bind("tcp://*:5556")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / time.strftime("server-%Y%m%d-%H%M%S.csv")
     try:
-        run(pub, router)
+        with open(path, "w", newline="", buffering=1) as f:  # line-buffered: a crash loses at most one row
+            writer = csv.writer(f)
+            writer.writerow(LOG_FIELDS)
+            print(f"logging to {path}")
+            run(pub, router, lambda *row: writer.writerow(row))
     finally:
         ctx.destroy(linger=0)  # don't wait to deliver queued snapshots on exit
 
 
-def run(pub, router):
-    match, seq, next_snapshot = Match(time.perf_counter()), 0, 0.0
+def run(pub, router, log):
+    match, seq, next_snapshot = Match(time.perf_counter(), log), 0, 0.0
     print("serving on ports 5555 (snapshots) and 5556 (client messages)")
     while True:
         router.poll(POLL_MS)
@@ -172,14 +196,21 @@ def run(pub, router):
                 ident, raw = frames
                 name, msg = ident.decode(), zmq.utils.jsonapi.loads(raw)
             except ValueError:  # wrong frame count, bad UTF-8 or bad JSON: drop it
+                log(now, "bad", "", "", "", "unreadable message")
                 continue
+            if isinstance(msg, dict):
+                log(now, "recv", name, msg["seq"] if number(msg.get("seq")) else "",
+                    msg["ts"] if number(msg.get("ts")) else "", "+".join(k for k in KINDS if k in msg))
             if reply := match.on_message(name, msg, now):
                 router.send_multipart([ident, zmq.utils.jsonapi.dumps(reply)])
         now = time.perf_counter()
         match.tick(now)
         if match.changed or now >= next_snapshot:
             seq += 1
-            pub.send_json({"seq": seq, "ts": time.time(), "t": time.perf_counter(), **match.message()})
+            ts = time.time()
+            raw = zmq.utils.jsonapi.dumps({"seq": seq, "ts": ts, "t": time.perf_counter(), **match.message()})
+            pub.send(raw)
+            log(now, "snapshot", "", seq, ts, len(raw))
             match.changed, next_snapshot = False, now + SNAPSHOT_EVERY
 
 

@@ -1,0 +1,44 @@
+# The Phase 5 experiment setup: the server, two headless bots and a load generator, all pinned
+# to the same CPUs. experiments.py runs it once per condition and sets the variables below;
+# by hand:  RUN_DIR=./results/try DELAY_MS=50 docker compose up --abort-on-container-exit
+x-game: &game
+  build: .
+  image: pong-experiments
+  cap_add: [NET_ADMIN]  # tc netem in netem.sh
+  init: true  # a real PID 1 that passes on SIGTERM, so stopping a run doesn't wait 10 s per container
+  cpuset: ${CPUSET:-0-1}
+  environment:
+    DELAY_MS: ${DELAY_MS:-0}
+    JITTER_MS: ${JITTER_MS:-0}
+    LOSS_PCT: ${LOSS_PCT:-0}
+    PONG_LOG_DIR: /logs
+  volumes:
+    - ${RUN_DIR:-./results/manual}:/logs
+
+services:
+  server:
+    <<: *game
+    command: ["python", "server.py"]
+
+  bot1:
+    <<: *game
+    depends_on: [server]
+    command: ["python", "bot.py", "bot1", "server", "--log", "/logs", "--seed", "${SEED1:-1}",
+              "--seconds", "${RUN_SECONDS:-120}"]
+
+  bot2:
+    <<: *game
+    depends_on: [server]
+    command: ["python", "bot.py", "bot2", "server", "--log", "/logs", "--seed", "${SEED2:-2}",
+              "--seconds", "${RUN_SECONDS:-120}"]
+
+  load:
+    image: pong-experiments
+    init: true
+    depends_on: [server]
+    cpuset: ${CPUSET:-0-1}
+    environment:
+      CPU_LOAD: ${CPU_LOAD:-0}
+      MEM_LOAD: ${MEM_LOAD:-0}
+      MEM_MB: ${MEM_MB:-256}
+    command: ["sh", "load.sh"]

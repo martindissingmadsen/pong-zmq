@@ -1,0 +1,3 @@
+# Only for plots.py (Phase 5); playing needs requirements.txt alone.
+-r requirements.txt
+matplotlib==3.11.2

@@ -1,4 +1,4 @@
-"""Pong client: draws the game state with pygame (see PLAN.md).
+"""Pong client: draws the game state with pygame.
 
     python client.py                local game, two players on one keyboard: W/S (left), Up/Down (right)
     python client.py NAME [HOST]    networked: join server.py on HOST (default localhost), W/S or Up/Down

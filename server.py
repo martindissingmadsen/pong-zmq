@@ -1,4 +1,4 @@
-"""Pong server: the referee between two clients (see PLAN.md).
+"""Pong server: the referee between two clients.
 
     python server.py
 

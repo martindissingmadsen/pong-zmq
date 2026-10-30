@@ -1,7 +1,6 @@
 """Pong game logic: pure functions on a state dict, no networking or graphics.
 
-Implements the "Game interface" contract in PLAN.md. The state has exactly the game
-fields of the state message; the server adds seq, ts and players:
+The state has exactly the game fields of the state message; the server adds seq, ts and players:
     {"ball": [x, y], "vel": [vx, vy], "paddles": [yL, yR], "score": [l, r], "hits": n}
 
 Positions are centres in game units, velocities in units per second.

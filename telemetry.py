@@ -1,4 +1,4 @@
-"""CSV logs for the client (Phase 4, see PLAN.md).
+"""CSV logs for the client (Phase 4).
 
     python client.py NAME HOST --log           writes logs/NAME-YYYYmmdd-HHMMSS-*.csv
 

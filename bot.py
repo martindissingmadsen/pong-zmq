@@ -1,4 +1,4 @@
-"""Headless bot: plays one networked match without a window, for experiments (see PLAN.md).
+"""Headless bot: plays one networked match without a window, for experiments.
 
     python bot.py NAME [HOST] [--miss SIGMA] [--wobble SIGMA] [--log DIR] [--seed N] [--seconds S]
 

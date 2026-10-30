@@ -37,6 +37,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 # reference palette: categorical slots in fixed order, text and grid in neutral inks
 SERIES = ("#2a78d6", "#eb6834", "#1baf7a")  # blue, orange, aqua
 SURFACE, TEXT, TEXT_2, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#8a8984", "#e6e5e1"
+SWEEPS = ("baseline", "delay", "loss", "cpu", "memory")  # the order of summary.csv and the traffic chart
 
 
 def read(path):
@@ -100,7 +101,8 @@ def summarise(results):
         info[name] = {"sweep": run["sweep"], "value": float(run["value"])}
         by_condition[name].append(run_metrics(results / name / f"rep{run['rep']}"))
     summary = {}
-    for name, runs in by_condition.items():
+    order = lambda name: (SWEEPS.index(info[name]["sweep"]), info[name]["value"])  # runs side by side end in any order
+    for name, runs in sorted(by_condition.items(), key=lambda item: order(item[0])):
         summary[name] = dict(info[name])
         for metric in runs[0]:
             values = [r[metric] for r in runs if r[metric] is not None]
@@ -140,7 +142,8 @@ def style(ax, title, ylabel):
 def zero_based(ax):
     """Start the y-axis at 0. Only after drawing: setting a limit switches autoscaling off."""
     ax.set_ylim(bottom=0)
-    if ax.get_ylim()[1] < 1e-9 or all(abs(v) < 1e-9 for line in ax.get_lines() for v in line.get_ydata()):
+    values = [v for line in ax.get_lines() for v in line.get_ydata()] + [bar.get_height() for bar in ax.patches]
+    if ax.get_ylim()[1] < 1e-9 or all(abs(v) < 1e-9 for v in values):
         ax.set_ylim(0, 1)  # all zero: show a plain 0-1 scale and say it, instead of zooming into nothing
         ax.text(0.5, 0.5, "0 in every run", transform=ax.transAxes, ha="center", fontsize=9, color=TEXT_2)
 

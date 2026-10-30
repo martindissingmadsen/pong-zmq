@@ -50,6 +50,14 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(m["msgs_per_s"], 12, "per client: (5 out + 7 in) a second")
         self.assertEqual(m["contacts"], 2)
 
+    def test_bars_are_not_all_zero(self):
+        fig, ax = plots.plt.subplots()
+        ax.bar([0, 1], [14, 13])
+        plots.zero_based(ax)
+        self.assertGreater(ax.get_ylim()[1], 13)
+        self.assertEqual(len(ax.texts), 0, "no '0 in every run' over real bars")
+        plots.plt.close(fig)
+
 
 if __name__ == "__main__":
     unittest.main()

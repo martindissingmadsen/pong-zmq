@@ -24,13 +24,13 @@ services:
     <<: *game
     depends_on: [server]
     command: ["python", "bot.py", "bot1", "server", "--log", "/logs", "--seed", "${SEED1:-1}",
-              "--seconds", "${RUN_SECONDS:-120}"]
+              "--seconds", "${RUN_SECONDS:-120}", "--wobble", "${WOBBLE:-0}"]
 
   bot2:
     <<: *game
     depends_on: [server]
     command: ["python", "bot.py", "bot2", "server", "--log", "/logs", "--seed", "${SEED2:-2}",
-              "--seconds", "${RUN_SECONDS:-120}"]
+              "--seconds", "${RUN_SECONDS:-120}", "--wobble", "${WOBBLE:-0}"]
 
   load:
     image: pong-experiments

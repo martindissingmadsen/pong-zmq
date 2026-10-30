@@ -41,6 +41,7 @@ CONDITIONS += [("memory", workers, {"MEM_LOAD": workers}) for workers in (4,)]
 SETTINGS = ("DELAY_MS", "JITTER_MS", "LOSS_PCT", "CPU_LOAD", "MEM_LOAD")
 NETWORK = ("delay", "loss")  # the sweeps that may run side by side
 SECONDS = {"cpu": 60, "memory": 60}  # frame times come once a second, so a minute is plenty; others 120
+WOBBLE = 25  # units; the bots keep correcting their aim until contact (bot.py --wobble), as people do
 
 
 def compose(project, *args, env=None, **kwargs):
@@ -51,6 +52,7 @@ def run_one(run_dir, settings, seeds, seconds, project, cpus):
     """One match under one condition. Returns the bots' exit code (or 'timeout') and the time it took."""
     run_dir.mkdir(parents=True)
     env = {**os.environ, "RUN_DIR": str(run_dir.resolve()), "RUN_SECONDS": str(seconds), "CPUSET": cpus,
+           "WOBBLE": str(WOBBLE),
            "SEED1": str(seeds[0]), "SEED2": str(seeds[1]), **{k: str(v) for k, v in settings.items()}}
     start = time.perf_counter()
     with open(run_dir / "compose.log", "w") as log:

@@ -50,6 +50,20 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(m["msgs_per_s"], 12, "per client: (5 out + 7 in) a second")
         self.assertEqual(m["contacts"], 2)
 
+    def test_what_the_opponent_saw(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            write(run / "bot1-1-contacts.csv",
+                  ["wall", "server_t", "seg", "side", "mine", "call", "late_ms", "answer_ms", "outcome", "agreed", "correction"],
+                  [[0, 0, 1, 0, 1, "hit", 4, 60, "hit", 1, 50],  # our own call: never a prediction
+                   [0, 0, 2, 1, 0, "hit", 2, 80, "hit", 1, 0.2],
+                   [0, 0, 3, 1, 0, "hit", 2, 80, "hit", 1, 30],  # glided
+                   [0, 0, 4, 1, 0, "hit", 2, 80, "hit", 1, 150],  # jumped
+                   [0, 0, 5, 1, 0, "hit", 2, 80, "goal", 0, ""]])  # hit or miss wrong
+            m = plots.run_metrics(run)
+        self.assertEqual(m["fixed_smoothly_pct"], 25)
+        self.assertEqual(m["visibly_wrong_pct"], 50, "a jump and a wrong hit or miss, of four predictions")
+
     def test_bars_are_not_all_zero(self):
         fig, ax = plots.plt.subplots()
         ax.bar([0, 1], [14, 13])

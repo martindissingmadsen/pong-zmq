@@ -1,11 +1,13 @@
 """Headless bot: plays one networked match without a window, for experiments (see PLAN.md).
 
-    python bot.py NAME [HOST] [--miss SIGMA] [--log DIR] [--seed N] [--seconds S]
+    python bot.py NAME [HOST] [--miss SIGMA] [--wobble SIGMA] [--log DIR] [--seed N] [--seconds S]
 
 Built on client.Link, so it speaks exactly the protocol a real client does: clock sync,
 key changes, its own hit or miss calls. It moves its paddle to where the ball will meet it,
 but aims off by a random amount per shot (normally distributed, SIGMA units, default 40),
-so it misses sometimes and a match ends. It presses Space whenever a ball waits and quits
+so it misses sometimes and a match ends. With --wobble SIGMA it also changes its mind every
+0.15 s by a further random amount, so like a person it keeps correcting until the ball arrives
+instead of waiting still; that is what makes the opponent's prediction hard. It presses Space whenever a ball waits and quits
 once the match is over, or after --seconds S. --log DIR writes the client CSV logs (see
 telemetry.py) and --seed N makes its aim repeatable, both for the experiments (experiments.py).
 
@@ -23,6 +25,7 @@ from game import HEIGHT
 FPS = 120  # decisions per second, like a client on a 120 Hz display
 DEADBAND = 4  # units; this close to the target the paddle stops, so it doesn't twitch
 READY_EVERY = 0.5  # s; how often to press Space again while a ball waits for us
+WOBBLE_EVERY = 0.15  # s; how often a wobbling bot changes its mind about where to aim
 
 
 def choose_dir(state, side, aim_off):
@@ -36,9 +39,10 @@ def choose_dir(state, side, aim_off):
     return 1 if target > y else -1
 
 
-def play(name, host, sigma, log_dir=None, seconds=None):
+def play(name, host, sigma, log_dir=None, seconds=None, wobble_sigma=0.0):
     link = Link(name, host, log_dir)
     d, ready, aim, last_ready = 0, False, (None, 0.0), 0.0
+    wobble, next_wobble = 0.0, 0.0
     stop = None if seconds is None else time.perf_counter() + seconds
     try:
         while stop is None or time.perf_counter() < stop:
@@ -55,7 +59,9 @@ def play(name, host, sigma, log_dir=None, seconds=None):
                 seg = link.rally.seg["id"]
                 if aim[0] != seg:  # a new shot: pick how far off this one is aimed
                     aim = (seg, random.gauss(0, sigma))
-                d = choose_dir(state, side, aim[1])
+                if wobble_sigma and now >= next_wobble:
+                    wobble, next_wobble = random.gauss(0, wobble_sigma), now + WOBBLE_EVERY
+                d = choose_dir(state, side, aim[1] + wobble)
             time.sleep(1 / FPS)
     finally:
         link.close()
@@ -63,7 +69,7 @@ def play(name, host, sigma, log_dir=None, seconds=None):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    options = {"--miss": "40", "--log": None, "--seed": None, "--seconds": None}
+    options = {"--miss": "40", "--wobble": "0", "--log": None, "--seed": None, "--seconds": None}
     for flag in options:
         if flag in args:
             i = args.index(flag)
@@ -76,6 +82,7 @@ if __name__ == "__main__":
         random.seed(int(options["--seed"]))
     seconds = None if options["--seconds"] is None else float(options["--seconds"])
     try:
-        play(args[0], args[1] if len(args) == 2 else "localhost", float(options["--miss"]), options["--log"], seconds)
+        play(args[0], args[1] if len(args) == 2 else "localhost", float(options["--miss"]), options["--log"], seconds,
+             float(options["--wobble"]))
     except KeyboardInterrupt:
         pass

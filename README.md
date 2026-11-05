@@ -6,11 +6,16 @@ paddle contacts, pings), so each player's paddle never waits for the network.
 
 ## Setup
 
+Needs Python 3.14 (the version the Docker image uses).
+
 ```sh
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+python3.14 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+Activation only lasts for the
+current terminal, so run `source .venv/bin/activate` again in each new one before the commands below.
 
 ## Play
 
@@ -26,7 +31,7 @@ python client.py NAME [HOST]     # ... then two clients (later ones watch)
 python -m unittest
 ```
 
-`test_plots.py` needs matplotlib: `pip install -r requirements-plots.txt`.
+`test_plots.py` needs matplotlib: `PIP_UPLOADED_PRIOR_TO=P3D pip install -r requirements-plots.txt`.
 
 ## Experiments
 

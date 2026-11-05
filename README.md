@@ -9,6 +9,7 @@ paddle contacts, pings), so each player's paddle never waits for the network.
 ```sh
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
+source .venv/bin/activate
 ```
 
 ## Play
